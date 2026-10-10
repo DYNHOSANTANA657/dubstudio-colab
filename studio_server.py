@@ -8,10 +8,11 @@ import mimetypes
 import re
 import secrets
 import shutil
+import socket
 import tempfile
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as _ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 from languages import PRESETS, languages_payload
@@ -40,6 +41,25 @@ DEFAULT_CONFIG = {
 STORE = JobStore()
 STATE_LOCK = threading.RLock()
 JOB_LOCKS = {}
+
+
+class ThreadingHTTPServer(_ThreadingHTTPServer):
+    """Only one Studio may own a local port, including on Windows.
+
+    Python's HTTPServer enables SO_REUSEADDR by default. On Windows that can
+    admit another listener, leaving requests nondeterministically served by an
+    old Studio. Exclusive binding must be set before bind, never combined with
+    address/port reuse. The public class name stays compatible with our tests.
+    """
+
+    allow_reuse_address = False
+    allow_reuse_port = False
+
+    def server_bind(self):
+        exclusive_option = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        if exclusive_option is not None:
+            self.socket.setsockopt(socket.SOL_SOCKET, exclusive_option, 1)
+        super().server_bind()
 
 def _raw_config():
     try:

@@ -411,11 +411,57 @@ def _validate_media(path: Path, role: str, job: Job, manifest: dict[str, Any], r
     return media
 
 
+def _current_approved_review(job: Job, manifest: dict[str, Any]) -> dict[str, Any] | None:
+    """Bind imports to the latest local approval, not just the media/job ID."""
+    path = job.directory / "review-approved.json"
+    if manifest["operation"] != "dub_video":
+        return None
+    if not path.exists():
+        if job.metadata.get("review_approved"):
+            raise PipelineError("A revisão aprovada atual não foi encontrada; reexporte-a antes de importar.")
+        return None
+    try:
+        approved = _validate_review(json.loads(path.read_text(encoding="utf-8")), job, manifest)
+        original = _validate_review(json.loads((job.directory / "studio-review.json").read_text(encoding="utf-8")), job, manifest)
+    except (OSError, ValueError) as exc:
+        raise PipelineError("Os arquivos locais da revisão aprovada não estão íntegros.") from exc
+    if approved["source_language"] != original["source_language"]:
+        raise PipelineError("A aprovação atual não corresponde ao idioma original da revisão.")
+    for language in manifest["target_languages"]:
+        _match_approved_segments(approved["translations"][language], original["translations"][language], translated=False)
+    snapshot_hash = approved.get("source_snapshot_sha256")
+    if snapshot_hash is not None:
+        try:
+            # Text-mode newline normalization preserves the JSON digest used in
+            # ZIP packages when this local checkpoint was written on Windows.
+            snapshot_text = (job.directory / "review-source.json").read_text(encoding="utf-8")
+            snapshot = json.loads(snapshot_text)
+        except (OSError, ValueError) as exc:
+            raise PipelineError("O snapshot original aprovado não foi encontrado ou está inválido.") from exc
+        if hashlib.sha256(snapshot_text.encode("utf-8")).hexdigest() != snapshot_hash:
+            raise PipelineError("O snapshot original aprovado foi alterado.")
+        _validate_identity(snapshot, job, manifest)
+        if snapshot.get("pipeline_version") != PIPELINE_VERSION or snapshot.get("source_language") != approved["source_language"]:
+            raise PipelineError("O snapshot aprovado não corresponde ao pipeline ou idioma original.")
+        _match_approved_segments(snapshot.get("segments"), original["translations"][manifest["target_languages"][0]], translated=False)
+    return approved
+
+
+def _match_approved_segments(received: Any, approved: list[dict], *, translated: bool = True) -> None:
+    if not isinstance(received, list) or len(received) != len(approved):
+        raise PipelineError("O resultado não contém todos os trechos da revisão aprovada atual.")
+    keys = ("id", "start", "end", "speaker", "text", "translated_text") if translated else ("id", "start", "end", "speaker", "text")
+    for actual, expected in zip(received, approved):
+        if not isinstance(actual, dict) or type(actual.get("id")) is not type(expected["id"]) or any(isinstance(actual.get(key), bool) for key in ("start", "end")) or any(actual.get(key) != expected.get(key) for key in keys):
+            raise PipelineError("O resultado diverge da revisão aprovada atual; retome o pacote revisado para gerar a versão correta.")
+
+
 def import_studio_result(job: Job, result_zip: Path) -> dict[str, Any]:
     """Validate an offline result atomically, with independent A/V measurements."""
     manifest = _manifest(job)
     if not zipfile.is_zipfile(result_zip):
         raise PipelineError("O arquivo importado não é um ZIP válido.")
+    approved_review = _current_approved_review(job, manifest)
     output_records: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="studio-validate-", dir=job.directory) as name:
         staging = Path(name)
@@ -445,7 +491,7 @@ def import_studio_result(job: Job, result_zip: Path) -> dict[str, Any]:
                 files, checksums = output.get("files"), output.get("checksums")
                 if not isinstance(files, dict) or not isinstance(checksums, dict):
                     raise PipelineError("Faltam arquivos ou checksums do resultado.")
-                required = {"video", "report"} if manifest["operation"] != "text_to_voice" else {"wav", "mp3", "report"}
+                required = {"video", "report"} if manifest["operation"] != "text_to_voice" else {"wav", "mp3", "report", "segments"}
                 if manifest["operation"] == "dub_video":
                     required.update({"segments", "original_srt", "translation_srt"})
                 if not required.issubset(files):
@@ -474,11 +520,16 @@ def import_studio_result(job: Job, result_zip: Path) -> dict[str, Any]:
                     raise PipelineError("Os checksums não correspondem exatamente aos arquivos declarados.")
                 report = _read_json(archive, members, paths["report"])
                 _validate_report(report, job, manifest, language)
+                evidence = None
                 if "segments" in paths:
                     evidence = _read_json(archive, members, paths["segments"])
                     if evidence.get("target_language") != language:
                         raise PipelineError("Os segmentos traduzidos pertencem a outro idioma.")
-                    _segments(evidence.get("segments"), float(manifest["input_metadata"]["duration"]))
+                    evidence_duration = (_number(report.get("summary", {}).get("duration"), "A duração da voz gerada")
+                                         if manifest["operation"] == "text_to_voice" else float(manifest["input_metadata"]["duration"]))
+                    _segments(evidence.get("segments"), evidence_duration)
+                    if approved_review:
+                        _match_approved_segments(evidence["segments"], approved_review["translations"][language])
                 for role in ("original_srt", "translation_srt"):
                     if role in paths:
                         try:
@@ -487,6 +538,10 @@ def import_studio_result(job: Job, result_zip: Path) -> dict[str, Any]:
                         except (UnicodeError, ValueError) as exc:
                             raise PipelineError("Uma evidência de legendas está vazia ou não é um SRT válido.") from exc
                 media = {role: _validate_media(staging / paths[role], role, job, manifest, report) for role in ("video", "wav", "mp3") if role in paths}
+                if manifest["operation"] == "text_to_voice" and evidence:
+                    actual_duration = media["wav"]["audio_duration"]
+                    if any(_number(item["end"], "O fim da fala gerada") > actual_duration + 0.01 for item in evidence["segments"]):
+                        raise PipelineError("Os tempos da voz gerada excedem a duração real do áudio.")
                 output_records.append({"language": language, "status": "complete", "files": paths, "checksums": checksums, "summary": report.get("summary", {}), "validation": {
                     "validated_at": int(time.time()), "media": media,
                     "authorized_clone": manifest["operation"] in {"dub_video", "text_to_voice"},
@@ -516,14 +571,28 @@ def import_studio_result(job: Job, result_zip: Path) -> dict[str, Any]:
 
 def _validate_review(payload: dict[str, Any], job: Job, manifest: dict[str, Any]) -> dict[str, Any]:
     _validate_identity(payload, job, manifest)
+    if payload.get("pipeline_version") != PIPELINE_VERSION:
+        raise PipelineError("A revisão pertence a uma versão de pipeline incompatível.")
     translations = payload.get("translations")
     if not isinstance(translations, dict) or set(translations) != set(manifest["target_languages"]):
         raise PipelineError("A revisão precisa conter os idiomas solicitados no projeto.")
-    if not isinstance(payload.get("source_language"), str) or not payload["source_language"].strip():
+    if not isinstance(payload.get("source_language"), str) or not re.fullmatch(r"[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*", payload["source_language"]):
         raise PipelineError("A revisão não informa o idioma original.")
     duration = float(manifest["input_metadata"]["duration"])
+    original_segments = None
     for segments in translations.values():
         _segments(segments, duration)
+        for segment in segments:
+            if any(isinstance(segment.get(key), bool) or not isinstance(segment.get(key), (int, float)) for key in ("start", "end")):
+                raise PipelineError("A revisão não possui tempos numéricos válidos.")
+            if isinstance(segment.get("id"), bool) or not isinstance(segment.get("id"), (int, str)):
+                raise PipelineError("A revisão não possui identificadores de trecho válidos.")
+            if not isinstance(segment.get("speaker"), str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", segment["speaker"]):
+                raise PipelineError("A revisão não possui locutores válidos.")
+        immutable = [{key: segment[key] for key in ("id", "start", "end", "speaker", "text")} for segment in segments]
+        if original_segments is not None and immutable != original_segments:
+            raise PipelineError("As versões por idioma não compartilham a mesma transcrição original.")
+        original_segments = immutable
     return payload
 
 
@@ -546,7 +615,7 @@ def export_approved_review(job: Job, payload: dict[str, Any]) -> Path:
     path = job.directory / "studio-review.json"
     if not path.exists():
         raise PipelineError("Importe a revisão do notebook antes de aprovar os textos.")
-    original = json.loads(path.read_text(encoding="utf-8"))
+    original = _validate_review(json.loads(path.read_text(encoding="utf-8")), job, manifest)
     approved = _validate_review(payload, job, manifest)
     if approved["source_language"] != original["source_language"]:
         raise PipelineError("A revisão aprovada alterou o idioma original.")
@@ -557,10 +626,28 @@ def export_approved_review(job: Job, payload: dict[str, Any]) -> Path:
         for segment, source in zip(segments, source_segments):
             if any(segment.get(key) != source.get(key) for key in ("id", "start", "end", "speaker", "text")):
                 raise PipelineError("Altere somente a tradução; os tempos, locutores e textos originais devem permanecer iguais.")
-    approved = {**approved, "approved_at": int(time.time()), "pipeline_version": PIPELINE_VERSION}
+    source_segments = original["translations"][manifest["target_languages"][0]]
+    snapshot = {
+        "schema_version": SCHEMA_VERSION, "pipeline_version": PIPELINE_VERSION,
+        "job_id": job.id, "input_sha256": manifest["input_sha256"],
+        "source_language": original["source_language"],
+        "segments": [{key: segment[key] for key in ("id", "start", "end", "speaker", "text")} for segment in source_segments],
+    }
+    source_encoded = json.dumps(snapshot, ensure_ascii=False, indent=2, allow_nan=False)
+    source_checksum = hashlib.sha256(source_encoded.encode("utf-8")).hexdigest()
+    approved = {**approved, "approved_at": int(time.time()), "pipeline_version": PIPELINE_VERSION,
+                "source_snapshot_sha256": source_checksum}
     encoded = json.dumps(approved, ensure_ascii=False, indent=2, allow_nan=False)
-    if len(encoded.encode("utf-8")) > MAX_JSON_BYTES:
+    if max(len(encoded.encode("utf-8")), len(source_encoded.encode("utf-8"))) > MAX_JSON_BYTES:
         raise PipelineError("A revisão aprovada excede o limite de 4 MB.")
+    resume_manifest = {**manifest, "review_snapshot": {
+        "path": "review-source.json", "sha256": source_checksum,
+        "approved_path": "review-approved.json", "approved_sha256": hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+    }}
+    public_workers = {f"worker/{name}": ROOT / "colab" / name for name in (
+        "dubstudio_bootstrap.py", "dubstudio_runner_v2.py", "dubstudio_colab_worker.py", "dubstudio_translate.py",
+        "requirements-app.txt", "requirements-musetalk.txt",
+    )}
     base_package = job.directory / PACKAGE_NAME
     if not zipfile.is_zipfile(base_package):
         raise PipelineError("O pacote original deste projeto não foi encontrado para a retomada.")
@@ -584,15 +671,21 @@ def export_approved_review(job: Job, payload: dict[str, Any]) -> Path:
                     raise PipelineError("Um arquivo original foi alterado no pacote de retomada.")
             with zipfile.ZipFile(staged, "w", zipfile.ZIP_STORED, allowZip64=True) as destination_archive:
                 for name, member in members.items():
-                    if name == "review-approved.json":
+                    if name in {"manifest.json", "review-approved.json", "review-source.json"} or name in public_workers:
                         continue
                     with original_archive.open(member) as source, destination_archive.open(name, "w", force_zip64=True) as destination:
                         shutil.copyfileobj(source, destination, 1024**2)
                 destination_archive.writestr("review-approved.json", encoded)
+                destination_archive.writestr("review-source.json", source_encoded)
+                destination_archive.writestr("manifest.json", json.dumps(resume_manifest, ensure_ascii=False, indent=2, allow_nan=False))
+                for name, file in public_workers.items():
+                    destination_archive.write(file, name)
         os.replace(staged, output)
     finally:
         if staged.exists():
             staged.unlink()
     _write_json(job.directory / "review-approved.json", approved)
-    job.metadata["review_approved"] = {"approved_at": approved["approved_at"], "languages": list(approved["translations"])}
+    _write_json(job.directory / "review-source.json", snapshot)
+    job.metadata["review_approved"] = {"approved_at": approved["approved_at"], "languages": list(approved["translations"]),
+                                       "source_snapshot_sha256": source_checksum}
     return output
