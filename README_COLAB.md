@@ -4,7 +4,7 @@ Studio em português com interface local e computação em notebook Colab manual
 
 ## Estado desta entrega
 
-Os contratos e as proteções locais estão em testes. A validação completa em GPU, incluindo reprodução de português para polonês, ainda está pendente. Suporte declarado pelo modelo não significa idioma já aprovado em teste. Não há garantia de timbre idêntico, prazo de processamento ou GPU gratuita disponível.
+Os contratos e as proteções locais estão em testes. Em uma T4 do Colab, um trecho de 20 segundos foi dublado de português para polonês sem lip-sync, importado, reproduzido e baixado pelo Studio; Texto para voz também foi executado e importado. Lip-sync e os demais cenários de aceite continuam em validação: consulte [RELATORIO_TESTES.md](RELATORIO_TESTES.md). Suporte declarado pelo modelo não significa idioma já aprovado em teste. Não há garantia de timbre idêntico, prazo de processamento ou GPU gratuita disponível.
 
 ## Abrir o Studio no Windows
 

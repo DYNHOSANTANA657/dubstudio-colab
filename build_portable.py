@@ -25,7 +25,7 @@ PUBLIC_FILES = (
     "colab/dubstudio_bootstrap.py", "colab/dubstudio_runner_v2.py",
     "colab/dubstudio_colab_worker.py", "colab/dubstudio_translate.py",
     "colab/requirements-app.txt", "colab/requirements-musetalk.txt",
-    "colab/test_runner_v2.py", "colab/test_cache_safety.py", "colab/test_translation_loading.py", "colab/test_review_resume.py", "colab/test_voice_outputs.py",
+    "colab/test_runner_v2.py", "colab/test_cache_safety.py", "colab/test_translation_loading.py", "colab/test_review_resume.py", "colab/test_voice_outputs.py", "colab/test_lipsync_contract.py", "colab/test_bootstrap_setup.py", "colab/test_muse_render_errors.py",
     "static/index.html", "static/app.js", "static/styles.css", "static/favicon.svg",
     "tests/test_studio_bridge.py", "tests/test_studio_server.py",
 )

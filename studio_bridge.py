@@ -302,9 +302,17 @@ def _segments(values: Any, duration: float | None = None) -> list[dict[str, Any]
     return values
 
 
-def _validate_lipsync(report: dict[str, Any], duration: float) -> None:
+def _validate_result_binding(payload: dict[str, Any], manifest: dict[str, Any]) -> None:
+    if payload.get("operation") != manifest["operation"]:
+        raise PipelineError("O resultado pertence a outra operação do Studio.")
+    expected = {role: item["sha256"] for role, item in manifest["inputs"].items()}
+    if payload.get("input_checksums") != expected:
+        raise PipelineError("O resultado não corresponde a todas as mídias de entrada, incluindo o áudio enviado.")
+
+
+def _validate_lipsync(report: dict[str, Any], duration: float, operation: str = "dub_video") -> bool:
     proof = report.get("lipsync")
-    if not isinstance(proof, dict) or proof.get("required") is not True or proof.get("confirmed") is not True:
+    if not isinstance(proof, dict) or proof.get("required") is not True:
         raise PipelineError("O resultado não confirma o lip-sync obrigatório.")
     ambiguity = proof.get("ambiguity", report.get("ambiguous_face_segments", []))
     if ambiguity != []:
@@ -316,23 +324,54 @@ def _validate_lipsync(report: dict[str, Any], duration: float) -> None:
     if not isinstance(segments, list):
         raise PipelineError("Os trechos confirmados de lip-sync não são válidos.")
     if not segments:
-        # Voice-over with no visible speaking face may legitimately preserve every frame.
-        if not (proof.get("no_visible_speaking_face") is True and proof.get("scene_analysis_complete") is True):
+        # A fully analysed face-free voice-over is not an applied/confirmed lip-sync.
+        if not (operation == "dub_video" and proof.get("no_visible_speaking_face") is True and proof.get("scene_analysis_complete") is True):
             raise PipelineError("Não há evidência de trechos faciais confirmados para o lip-sync.")
+        if proof.get("confirmed") is not False or proof.get("applied") is not False:
+            raise PipelineError("Uma narração sem rosto não pode declarar lip-sync aplicado ou confirmado.")
+    elif proof.get("confirmed") is not True or proof.get("applied") is not True:
+        raise PipelineError("O resultado não confirma que o lip-sync foi aplicado aos trechos faciais.")
+    elif proof.get("no_visible_speaking_face") is True:
+        raise PipelineError("A evidência declara rostos sincronizados e ausência de rosto ao mesmo tempo.")
     previous_end = 0.0
+    windows = []
     for segment in segments:
         if not isinstance(segment, dict):
             raise PipelineError("Um trecho confirmado de lip-sync não é válido.")
         start, end = _number(segment.get("start"), "O início do lip-sync"), _number(segment.get("end"), "O fim do lip-sync")
-        if start < previous_end - 0.05 or start < 0 or end <= start or end > duration + 1.0:
+        if start < previous_end - 0.001 or start < 0 or end <= start or end > duration + 0.05:
             raise PipelineError("Os trechos faciais confirmados possuem tempos inseguros.")
         if not str(segment.get("coordinate_source") or proof.get("coordinate_source") or "").strip():
             raise PipelineError("A evidência de lip-sync não informa a origem das coordenadas faciais.")
         previous_end = end
+        windows.append((start, end))
+    preserved = report.get("preserved_no_speaker_visual_segments")
+    if not isinstance(preserved, list):
+        raise PipelineError("O relatório não identifica as cenas preservadas sem rosto sincronizado.")
+    previous_end = 0.0
+    for segment in preserved:
+        if not isinstance(segment, dict):
+            raise PipelineError("Uma cena preservada não possui uma janela válida.")
+        start, end = _number(segment.get("start"), "O início da cena preservada"), _number(segment.get("end"), "O fim da cena preservada")
+        if start < previous_end - 0.001 or start < 0 or end <= start or end > duration + 0.05:
+            raise PipelineError("As cenas preservadas possuem tempos inseguros.")
+        previous_end = end
+        windows.append((start, end))
+    cursor = 0.0
+    for start, end in sorted(windows):
+        if start < cursor - 0.001:
+            raise PipelineError("Uma cena preservada sobrepõe um trecho de lip-sync ou outra cena.")
+        if start > cursor + 0.05:
+            raise PipelineError("O relatório omite uma janela de vídeo sem explicar se foi sincronizada ou preservada.")
+        cursor = end
+    if cursor < duration - 0.05:
+        raise PipelineError("O relatório não cobre o final do vídeo com cenas sincronizadas ou preservadas.")
+    return bool(segments)
 
 
 def _validate_report(report: dict[str, Any], job: Job, manifest: dict[str, Any], language: str) -> None:
     _validate_identity(report, job, manifest)
+    _validate_result_binding(report, manifest)
     if report.get("pipeline_version") != PIPELINE_VERSION or report.get("target_language") != language:
         raise PipelineError("O relatório não corresponde ao idioma ou à versão do pipeline solicitado.")
     operation = manifest["operation"]
@@ -341,10 +380,10 @@ def _validate_report(report: dict[str, Any], job: Job, manifest: dict[str, Any],
         if manifest.get("authorization", {}).get("voice_clone_confirmed") is not True or not isinstance(proof, dict) or proof.get("required") is not True or proof.get("confirmed") is not True or proof.get("authorized") is not True:
             raise PipelineError("O resultado não confirma a preservação autorizada do timbre original.")
     if manifest["options"].get("require_lipsync") is True:
-        _validate_lipsync(report, float(manifest["input_metadata"]["duration"]))
+        _validate_lipsync(report, float(manifest["input_metadata"]["duration"]), operation)
     else:
         proof = report.get("lipsync")
-        if not isinstance(proof, dict) or proof.get("required") is not False or proof.get("confirmed") is not False:
+        if not isinstance(proof, dict) or proof.get("required") is not False or proof.get("confirmed") is not False or proof.get("applied", False) is not False:
             raise PipelineError("O relatório precisa declarar que o lip-sync foi desativado, sem confirmar uma etapa não solicitada.")
 
 
@@ -398,7 +437,15 @@ def _validate_media(path: Path, role: str, job: Job, manifest: dict[str, Any], r
         original_audio = job.input_path
         if manifest["operation"] == "lipsync_video":
             original_audio = _input_path(job, "audio") or original_audio
-        if probe_video(original_audio).get("audio"):
+            submitted_duration = _probe_streams(original_audio)["audio_duration"]
+            if submitted_duration is None or submitted_duration > media["video_duration"] + 0.000001:
+                raise PipelineError("O áudio enviado excede a faixa final de vídeo e não pode ser cortado.")
+            tail = min(5.0, max(0.5, submitted_duration * 0.1), submitted_duration)
+            start = max(0.0, submitted_duration - tail)
+            # Compare the same timeline window, not the end of a padded video.
+            if _audio_window_peak(original_audio, start, tail) > -45 and _audio_window_peak(path, start, tail) < -55:
+                raise PipelineError("O final do áudio enviado ficou silencioso na janela correspondente do resultado.")
+        elif probe_video(original_audio).get("audio"):
             tail = min(5.0, max(0.5, expected * 0.1))
             if _tail_max_volume(original_audio, tail) > -45 and _tail_max_volume(path, tail) < -55:
                 raise PipelineError("O áudio ficou silencioso no final apesar de existir fala ou áudio no original.")
@@ -409,6 +456,19 @@ def _validate_media(path: Path, role: str, job: Job, manifest: dict[str, Any], r
         if duration is None or abs(_number(duration, "A duração declarada") - media["audio_duration"]) > 1.0:
             raise PipelineError("A duração do áudio não corresponde ao relatório.")
     return media
+
+
+def _audio_window_peak(path: Path, start: float, duration: float) -> float:
+    executable = shutil.which("ffmpeg")
+    if not executable:
+        raise PipelineError("FFmpeg é necessário para verificar a cobertura do áudio enviado.")
+    result = subprocess.run([executable, "-hide_banner", "-ss", f"{start:.6f}", "-i", str(path), "-t", f"{duration:.6f}",
+                             "-map", "0:a:0", "-af", "volumedetect", "-f", "null", "-"],
+                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90)
+    match = re.search(r"max_volume:\s*(-?(?:\d+(?:\.\d+)?)|-inf)\s*dB", result.stderr)
+    if result.returncode or not match:
+        raise PipelineError("Não foi possível verificar a janela final do áudio enviado.")
+    return -1000.0 if match.group(1) == "-inf" else float(match.group(1))
 
 
 def _current_approved_review(job: Job, manifest: dict[str, Any]) -> dict[str, Any] | None:
@@ -469,6 +529,7 @@ def import_studio_result(job: Job, result_zip: Path) -> dict[str, Any]:
             members = _safe_members(archive)
             result = _read_json(archive, members, "result.json")
             _validate_identity(result, job, manifest)
+            _validate_result_binding(result, manifest)
             if result.get("pipeline_version") != PIPELINE_VERSION:
                 raise PipelineError("A versão do pipeline do resultado é incompatível.")
             outputs = result.get("outputs")
@@ -538,6 +599,9 @@ def import_studio_result(job: Job, result_zip: Path) -> dict[str, Any]:
                         except (UnicodeError, ValueError) as exc:
                             raise PipelineError("Uma evidência de legendas está vazia ou não é um SRT válido.") from exc
                 media = {role: _validate_media(staging / paths[role], role, job, manifest, report) for role in ("video", "wav", "mp3") if role in paths}
+                lipsync_confirmed = False
+                if manifest["options"].get("require_lipsync") is True:
+                    lipsync_confirmed = _validate_lipsync(report, media["video"]["video_duration"], manifest["operation"])
                 if manifest["operation"] == "text_to_voice" and evidence:
                     actual_duration = media["wav"]["audio_duration"]
                     if any(_number(item["end"], "O fim da fala gerada") > actual_duration + 0.01 for item in evidence["segments"]):
@@ -546,7 +610,7 @@ def import_studio_result(job: Job, result_zip: Path) -> dict[str, Any]:
                     "validated_at": int(time.time()), "media": media,
                     "authorized_clone": manifest["operation"] in {"dub_video", "text_to_voice"},
                     "lipsync_requested": manifest["options"].get("require_lipsync") is True,
-                    "lipsync_confirmed": manifest["options"].get("require_lipsync") is True,
+                    "lipsync_confirmed": lipsync_confirmed,
                     "duration_tolerance_seconds": 1.0,
                 }})
         successes = [record for record in output_records if record["status"] == "complete"]
