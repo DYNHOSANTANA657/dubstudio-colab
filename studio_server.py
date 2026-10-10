@@ -26,12 +26,13 @@ CONFIG_PATH = RUNTIME / "config.json"
 NOTEBOOK_PATH = ROOT / "DubStudio_Colab.ipynb"
 PACKAGE_NAME = "pacote-colab.zip"
 VERSION = "3.0.0"
+PUBLIC_NOTEBOOK_URL = "https://colab.research.google.com/github/DYNHOSANTANA657/dubstudio-colab/blob/main/DubStudio_Colab.ipynb"
 MAX_UPLOAD = 8 * 1024**3
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".m4v"}
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".mp4"}
 OPERATIONS = {"dub_video", "lipsync_video", "text_to_voice"}
 DEFAULT_CONFIG = {
-    "colab": {"notebook_url": ""},
+    "colab": {"notebook_url": PUBLIC_NOTEBOOK_URL},
     "studio": {"performance_profile": "fast_lipsync", "preserve_ambience": True,
                "review_mode": "before_voice", "cache_on_drive": True, "max_export_resolution": 1080},
     "limits": {"max_upload_gb": 8, "max_duration_minutes": 20, "recommended_duration_minutes": 2},
@@ -91,7 +92,7 @@ def save_config(payload):
     if raw.get("studio_schema_version") != 2:
         # Um notebook legado não aceita o manifesto novo. Preserve a configuração
         # antiga, mas só abra um notebook novo escolhido explicitamente.
-        if current["colab"]["notebook_url"] and "notebook_url" not in colab:
+        if previous_colab.get("notebook_url") and "notebook_url" not in colab:
             raw["legacy_colab"] = previous_colab
             current["colab"]["notebook_url"] = ""
             raw["colab"] = current["colab"]
@@ -239,7 +240,7 @@ def parse_job_options(fields):
     return {"operation": operation, "mode": "colab", "target_languages": languages,
             "target_language": languages[0], "source_language": fields.getfirst("source_language", "auto"),
             "performance_profile": profile, "review_mode": review_mode,
-            "cache_on_drive": load_config()["studio"]["cache_on_drive"],
+            "cache_on_drive": as_bool(fields.getfirst("cache_on_drive"), load_config()["studio"]["cache_on_drive"]),
             "preset": "original", "require_lipsync": require_lipsync,
             "preserve_ambience": as_bool(fields.getfirst("preserve_ambience"), True),
             "voice_clone_consent": True, "voice_clone_confirmed": True,

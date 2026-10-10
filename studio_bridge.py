@@ -171,9 +171,11 @@ def prepare_studio_package(job: Job) -> Path:
             for role, path in input_files.items():
                 archive.write(path, inputs[role]["path"])
             # Bundle only public worker source; never settings or runtime files.
-            for path in sorted((ROOT / "colab").glob("*.py")):
+            for name in ("dubstudio_bootstrap.py", "dubstudio_runner_v2.py", "dubstudio_colab_worker.py", "dubstudio_translate.py"):
+                path = ROOT / "colab" / name
                 archive.write(path, f"worker/{path.name}")
-            for path in sorted((ROOT / "colab").glob("requirements*.txt")):
+            for name in ("requirements-app.txt", "requirements-musetalk.txt"):
+                path = ROOT / "colab" / name
                 archive.write(path, f"worker/{path.name}")
         os.replace(staged, package)
     finally:
