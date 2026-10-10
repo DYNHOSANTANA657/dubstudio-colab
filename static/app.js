@@ -187,6 +187,7 @@ async function loadSettings() {
     const payload = await api('/api/settings');
     state.settings = payload.config || payload;
     applySettingsToControls();
+    if (state.jobs.length) renderJobs();
   } catch (error) { toast(error.message); }
 }
 function applySettingsToControls() {
@@ -217,6 +218,7 @@ async function saveSettings(event) {
     state.settings = result.config || { ...state.settings, colab: { ...state.settings.colab, notebook_url: $('#notebookUrl').value.trim() }, studio: { ...state.settings.studio, performance_profile: $('#defaultQuality').value, cache_on_drive: $('#driveCache').checked } };
     applySettingsToControls();
     $('#settingsSaved').textContent = 'Configurações salvas.';
+    if (state.jobs.length) renderJobs();
     toast('Seu estúdio está configurado.');
   } catch (error) { toast(error.message); }
   finally { button.disabled = false; }
@@ -334,10 +336,11 @@ async function startProject(event) {
   finally { button.disabled = false; $('#createButtonLabel').textContent = 'Preparar e abrir no Colab'; }
 }
 function statusName(status) {
+  if (status === 'legacy') return 'Histórico preservado';
   return ({ queued: 'Preparando', preparing: 'Preparando pacote', preparing_colab: 'Preparando pacote', running: 'Preparando pacote', awaiting_colab: 'Pacote pronto', awaiting_import: 'Aguardando resultado', processing_colab: 'No Colab', external_running: 'No Colab', review_required: 'Revisar tradução', awaiting_review: 'Revisar tradução', review_approved: 'Revisão aprovada', validating: 'Conferindo resultado', complete: 'Resultado aprovado', partial: 'Resultados parciais', failed: 'Precisa de atenção', archived: 'Arquivado', cancelled: 'Interrompido' })[status] || 'Acompanhe pelo notebook';
 }
 function isExternal(job) { return ['awaiting_import', 'external_running', 'processing_colab'].includes(job.status); }
-function jobTitle(job) { return job.options?.original_name || job.options?.title || (job.options?.operation === 'text_to_voice' ? 'Narração de texto' : `Projeto ${job.id}`); }
+function jobTitle(job) { return job.options?.original_name || job.options?.title || job.metadata?.original_name || (job.options?.operation === 'text_to_voice' ? 'Narração de texto' : `Projeto ${job.id}`); }
 function jobLanguages(job) { return job.options?.target_languages || (job.options?.language ? [job.options.language] : []); }
 function outputsFor(job) {
   const value = job.metadata?.outputs || job.metadata?.studio_results || job.outputs || [];
@@ -358,11 +361,18 @@ async function loadJobs({ quiet = false } = {}) {
 }
 function renderJobs() {
   if (!state.selectedJob || !state.jobs.some(job => job.id === state.selectedJob)) state.selectedJob = state.jobs[0]?.id || null;
-  $('#jobList').innerHTML = state.jobs.map(job => `<button class="job-item ${job.id === state.selectedJob ? 'active' : ''}" data-job="${escapeHtml(job.id)}"><span class="job-item-title">${escapeHtml(jobTitle(job))}</span><span class="job-item-meta"><i class="${job.status === 'complete' ? 'ready' : job.status === 'failed' ? 'failed' : ''}"></i>${escapeHtml(statusName(job.status))}</span><span class="job-item-languages">${escapeHtml(jobLanguages(job).map(languageName).join(' · ') || 'Lip-sync com áudio')}</span></button>`).join('') || '<div class="empty-state"><span data-icon="folder"></span><h3>Seu espaço está pronto</h3><p>As suas criações aparecerão aqui.</p><button class="primary" data-new-project>Criar um projeto</button></div>';
+  const jobList = $('#jobList');
+  const markup = state.jobs.map(job => `<button class="job-item ${job.id === state.selectedJob ? 'active' : ''}" data-job="${escapeHtml(job.id)}"><span class="job-item-title">${escapeHtml(jobTitle(job))}</span><span class="job-item-meta"><i class="${job.status === 'complete' ? 'ready' : job.status === 'failed' ? 'failed' : ''}"></i>${escapeHtml(statusName(job.status))}</span><span class="job-item-languages">${escapeHtml(jobLanguages(job).map(languageName).join(' · ') || 'Lip-sync com áudio')}</span></button>`).join('') || '<div class="empty-state"><span data-icon="folder"></span><h3>Seu espaço está pronto</h3><p>As suas criações aparecerão aqui.</p><button class="primary" data-new-project>Criar um projeto</button></div>';
+  // Unchanged polling must not replace focused/clicked project buttons.
+  if (jobList.dataset.renderSignature !== markup) {
+    jobList.innerHTML = markup;
+    jobList.dataset.renderSignature = markup;
+    paintIcons(jobList);
+  }
   const selected = state.jobs.find(job => job.id === state.selectedJob);
   if (selected) renderJobDetail(selected);
   else $('#jobDetail').innerHTML = '<div class="empty-state"><span data-icon="spark"></span><h3>Sua próxima criação começa aqui</h3><p>Escolha um vídeo ou transforme suas palavras em voz.</p><button class="primary" data-new-project>Começar um projeto</button></div>';
-  paintIcons($('#jobList')); paintIcons($('#jobDetail'));
+  paintIcons($('#jobDetail'));
 }
 function detailSignature(job) {
   return JSON.stringify([job.id, job.status, job.has_colab_package, job.has_output, job.has_report, job.error, outputsFor(job), Boolean(job.metadata?.review), job.options?.operation, job.options?.require_lipsync, notebookUrl()]);
@@ -381,6 +391,7 @@ function renderOutput(job, output) {
   return `<section class="output-card"><div class="output-heading"><span data-icon="globe"></span><strong>${escapeHtml(languageName(language))}</strong><span class="status-badge ${approved ? 'ready' : status === 'failed' ? 'failed' : ''}">${approved ? 'Arquivos conferidos' : status === 'failed' ? 'Falhou' : 'Em validação'}</span>${lipBadge}</div>${links ? `<div class="output-files">${links}</div>` : ''}<p class="output-note">${escapeHtml(output.error || output.message || (approved ? 'Veja o relatório e confira a reprodução desta versão.' : 'O download será liberado quando a importação aprovar esta versão.'))}</p></section>`;
 }
 function renderJobDetail(job) {
+  const legacy = job.status === 'legacy' || job.execution_location === 'legacy' || job.metadata?.legacy === true;
   const existing = $('[data-current-job]', $('#jobDetail'));
   const signature = detailSignature(job);
   if (existing && existing.dataset.currentJob === job.id && existing.dataset.signature === signature) {
@@ -392,7 +403,14 @@ function renderJobDetail(job) {
   const voice = outputs.find(output => ['complete', 'approved', 'validated'].includes(output.status) && output.files?.wav);
   const isTts = job.options?.operation === 'text_to_voice';
   const preview = playable ? `<video controls playsinline preload="metadata" class="job-preview" src="${outputPath(job, playable.language, 'video', true)}"></video>` : voice ? `<audio controls preload="metadata" class="job-preview audio" src="${outputPath(job, voice.language, 'wav', true)}"></audio>` : !isTts ? `<video controls playsinline preload="metadata" class="job-preview" src="${jobPath(job.id, '/source')}"></video>` : '';
-  const reviewAvailable = ['review_required', 'awaiting_review'].includes(job.status) || job.metadata?.review || job.metadata?.review_available;
+  if (legacy) {
+    $('#jobDetail').innerHTML = `<div class="job-detail-content" data-current-job="${escapeHtml(job.id)}"><div class="job-kicker"><div><span class="eyebrow">PROJETO ${escapeHtml(job.id.toUpperCase())}</span><h2>${escapeHtml(jobTitle(job))}</h2></div><span class="status-badge">Histórico preservado</span></div><p class="job-message" data-job-message>${escapeHtml(job.message || 'Arquivos anteriores preservados.')}</p>${preview}<p class="settings-help">Este projeto usa o formato antigo. Para processá-lo no Colab, crie um novo projeto em Dublar vídeo. Nenhuma tarefa antiga será retomada automaticamente.</p><div class="job-actions"><span class="quiet-label">${new Date(Number(job.created_at || 0) * 1000).toLocaleDateString('pt-BR')}</span><button class="archive-button" type="button" data-action="archive">Arquivar projeto</button></div></div>`;
+    const legacyDetail = $('[data-current-job]', $('#jobDetail'));
+    legacyDetail.dataset.signature = signature;
+    paintIcons(legacyDetail);
+    return;
+  }
+  const reviewAvailable = !legacy && (['review_required', 'awaiting_review'].includes(job.status) || job.metadata?.review || job.metadata?.review_available);
   const url = notebookUrl();
   const workflow = job.has_colab_package ? `<section class="colab-workflow"><div class="workflow-head"><span class="colab-symbol small">co</span><h3>Continue sua criação no Colab</h3></div><p>Baixe o pacote, abra o notebook e escolha o ZIP no seletor de upload. Execute as células e importe aqui o resultado final.</p><div class="inline-actions"><button class="primary" type="button" data-action="open-colab"><span data-icon="external"></span>Abrir no Colab</button><a href="${jobPath(job.id, '/colab-package')}" class="secondary" download><span data-icon="download"></span>Baixar pacote</a></div>${url ? '' : '<p class="settings-help">Salve o endereço público em Configurações, ou baixe o notebook .ipynb para abri-lo manualmente.</p><a class="text-link" href="/api/colab/notebook" download>Baixar notebook .ipynb</a>'}<label class="import-drop"><span data-icon="upload"></span><span>Importar resultado final (.zip)</span><input class="visually-hidden" type="file" data-import="result" accept=".zip,application/zip"></label><label class="import-drop"><span data-icon="translate"></span><span>Importar tradução para revisão (.zip)</span><input class="visually-hidden" type="file" data-import="review" accept=".zip,application/zip"></label></section>` : '<div class="external-progress"><span data-icon="folder"></span>Preparando seu pacote neste computador…</div>';
   $('#jobDetail').innerHTML = `<div class="job-detail-content" data-current-job="${escapeHtml(job.id)}"><div class="job-kicker"><div><span class="eyebrow">PROJETO ${escapeHtml(job.id.toUpperCase())}</span><h2>${escapeHtml(jobTitle(job))}</h2></div><span class="status-badge ${job.status === 'complete' ? 'ready' : job.status === 'failed' ? 'failed' : ''}">${escapeHtml(statusName(job.status))}</span></div><p class="job-message" data-job-message>${escapeHtml(job.message || job.stage || '')}</p>${isExternal(job) ? '<div class="external-progress"><span data-icon="colab"></span>Execução no Colab — acompanhe pelo notebook</div>' : ''}${preview}${job.error ? `<div class="error-banner">${escapeHtml(job.error)}</div>` : ''}${workflow}${reviewAvailable ? '<section class="review-card"><h3>Revisão da tradução</h3><p>Confira e ajuste as falas antes de sintetizar as vozes. Os tempos originais serão mantidos.</p><div class="inline-actions"><button class="secondary" type="button" data-action="load-review">Abrir revisão</button></div><div id="reviewEditor"></div></section>' : ''}${outputs.length ? `<div class="result-header"><h3>Versões do seu projeto</h3><span class="quiet-label">${outputs.length} ${outputs.length === 1 ? 'idioma' : 'idiomas'}</span></div>${outputs.map(output => renderOutput(job, output)).join('')}` : ''}<div class="job-actions"><span class="quiet-label">${new Date(Number(job.created_at || 0) * 1000).toLocaleDateString('pt-BR')}</span><button class="archive-button" type="button" data-action="archive">Arquivar projeto</button></div></div>`;
