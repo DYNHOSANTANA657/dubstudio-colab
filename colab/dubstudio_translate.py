@@ -52,6 +52,41 @@ def translations_are_valid(translations: list[str], segments: list[dict], target
     return len(translations) == len(segments) and all(is_sane_translation(item, target) for item in translations)
 
 
+def configure_madlad_weight_tying(model_class) -> bool:
+    """Backport the upstream T5 loading fix, without changing model weights.
+
+    MADLAD's checkpoint stores separate input embeddings and output projection.
+    Transformers 5.2 resolves missing shared.weight from the first present key;
+    lm_head must be last. See huggingface/transformers PR #48238.
+    Older versions use a different representation and need no backport.
+    """
+    mapping = getattr(model_class, "_tied_weights_keys", None)
+    expected = {
+        "encoder.embed_tokens.weight": "shared.weight",
+        "decoder.embed_tokens.weight": "shared.weight",
+        "lm_head.weight": "shared.weight",
+    }
+    if not isinstance(mapping, dict) or mapping != expected:
+        return False
+    changed = list(mapping) != list(expected)
+    model_class._tied_weights_keys = expected
+    return changed
+
+
+def validate_madlad_embeddings(model, tensor_api) -> None:
+    """Refuse the silent encoder/lm_head corruption before generating text."""
+    encoder = model.encoder.embed_tokens.weight
+    decoder = model.decoder.embed_tokens.weight
+    projection = model.lm_head.weight
+    if not tensor_api.equal(encoder, decoder) or tensor_api.equal(encoder, projection):
+        raise RuntimeError("Os embeddings do MADLAD foram carregados incorretamente. A tradução foi interrompida antes de gerar texto inválido.")
+
+
+def generation_reached_eos(token_ids: list[int], eos_token_id) -> bool:
+    eos = {eos_token_id} if isinstance(eos_token_id, int) else set(eos_token_id or [])
+    return bool(eos.intersection(token_ids[1:]))
+
+
 def generate_nllb(segments: list[dict], source: str, target: str) -> list[str]:
     import torch
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
@@ -77,15 +112,22 @@ def generate_nllb(segments: list[dict], source: str, target: str) -> list[str]:
 
 def generate_madlad(segments: list[dict], target: str) -> list[str]:
     import torch
-    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, BitsAndBytesConfig
+    from transformers import T5ForConditionalGeneration, AutoTokenizer, BitsAndBytesConfig
     if not torch.cuda.is_available():
         raise RuntimeError("A tradução MADLAD exige a GPU concedida pelo Colab.")
+    if configure_madlad_weight_tying(T5ForConditionalGeneration):
+        print("MADLAD: correção upstream do carregamento T5 aplicada (PR #48238).", flush=True)
     tokenizer = AutoTokenizer.from_pretrained("google/madlad400-3b-mt")
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        "google/madlad400-3b-mt", torch_dtype=torch.float16, device_map={"": 0}, low_cpu_mem_usage=True,
+    model = T5ForConditionalGeneration.from_pretrained(
+        "google/madlad400-3b-mt", dtype=torch.float16, device_map={"": 0}, low_cpu_mem_usage=True,
         quantization_config=BitsAndBytesConfig(load_in_8bit=True),
     )
     try:
+        model.eval()
+        validate_madlad_embeddings(model, torch)
+        if tokenizer.eos_token_id != model.config.eos_token_id:
+            raise RuntimeError("O tokenizer e o modelo MADLAD discordam sobre o token final. A tradução não será executada.")
+        print("MADLAD: embeddings de entrada e projeção de saída conferidos.", flush=True)
         translated = []
         for index, segment in enumerate(segments, 1):
             print(f"MADLAD {target}: segmento {index}/{len(segments)}", flush=True)
@@ -97,7 +139,7 @@ def generate_madlad(segments: list[dict], target: str) -> list[str]:
                     raise RuntimeError("Um segmento excede o limite do tradutor. Divida o texto antes de continuar.")
                 with torch.inference_mode():
                     output = model.generate(**encoded, max_new_tokens=512, num_beams=4, repetition_penalty=1.05)
-                if output.shape[1] >= 512:
+                if not generation_reached_eos(output[0].tolist(), model.config.eos_token_id):
                     raise RuntimeError("O tradutor atingiu o limite de saída; segmento não será aceito incompleto.")
                 output_pieces.append(tokenizer.batch_decode(output, skip_special_tokens=True)[0].strip())
             translated.append(" ".join(output_pieces))

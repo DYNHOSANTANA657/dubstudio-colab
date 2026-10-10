@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import wave
 import zipfile
 from pathlib import Path, PurePosixPath
 
@@ -134,18 +135,91 @@ def validate_review(review: dict, manifest: dict, source_segments: list[dict]) -
     if review.get("schema_version") != SCHEMA_VERSION or review.get("job_id") != manifest["job_id"] or review.get("input_sha256") != manifest["input_sha256"]:
         raise PipelineError("A revisão pertence a outro projeto ou vídeo.")
     translations = review.get("translations", {})
+    if not isinstance(translations, dict) or set(translations) != set(manifest["target_languages"]):
+        raise PipelineError("A revisão não corresponde aos idiomas solicitados.")
     for language in manifest["target_languages"]:
         items = translations.get(language)
         if not isinstance(items, list) or len(items) != len(source_segments):
             raise PipelineError(f"A revisão de {language} não contém todos os segmentos.")
         for original, revised in zip(source_segments, items):
-            if not isinstance(revised, dict) or revised.get("id") != original.get("id") or any(abs(float(revised.get(key, -1)) - float(original[key])) > 0.002 for key in ("start", "end")):
+            try:
+                if not isinstance(revised, dict) or any(isinstance(revised.get(key), bool) for key in ("start", "end")):
+                    raise ValueError()
+                revised_times = [float(revised.get(key, -1)) for key in ("start", "end")]
+            except (TypeError, ValueError) as exc:
+                raise PipelineError("A revisão alterou identificadores ou tempos da transcrição.") from exc
+            if type(revised.get("id")) is not type(original.get("id")) or revised.get("id") != original.get("id") or not all(math.isfinite(value) for value in revised_times) or any(abs(value - float(original[key])) > 0.002 for value, key in zip(revised_times, ("start", "end"))):
                 raise PipelineError("A revisão alterou identificadores ou tempos da transcrição.")
-            if not str(revised.get("translated_text", "")).strip():
+            if not isinstance(revised.get("translated_text"), str) or not revised["translated_text"].strip():
                 raise PipelineError("A revisão contém fala traduzida vazia.")
             if any(revised.get(key) != original.get(key) for key in ("speaker", "text")):
                 raise PipelineError("A revisão alterou locutores ou o texto original.")
     return translations
+
+
+def load_approved_snapshot(package: Path, manifest: dict, duration: float) -> dict | None:
+    """An approved transcript is frozen input, not a fresh ASR prediction."""
+    review_path = package / "review-approved.json"
+    contract = manifest.get("review_snapshot")
+    if not review_path.exists() and contract is None:
+        return None
+    if manifest["operation"] != "dub_video" or not isinstance(contract, dict):
+        raise PipelineError("Reexporte a revisão pelo Studio atualizado: falta o snapshot verificável da transcrição original.")
+    if not math.isfinite(duration) or duration <= 0:
+        raise PipelineError("A duração real da mídia não pôde ser confirmada para esta revisão.")
+    payloads = {}
+    for role, path_key, hash_key in (("source", "path", "sha256"), ("approved", "approved_path", "approved_sha256")):
+        expected_path = "review-source.json" if role == "source" else "review-approved.json"
+        if contract.get(path_key) != expected_path or not re.fullmatch(r"[0-9a-f]{64}", str(contract.get(hash_key, ""))):
+            raise PipelineError("O contrato do snapshot da revisão é inválido.")
+        file = safe_path(package, expected_path)
+        if not file.is_file() or file.stat().st_size > 4 * 1024**2 or sha256(file) != contract[hash_key]:
+            raise PipelineError("Checksum divergente no snapshot ou na revisão aprovada.")
+        payload = read_json(file)
+        if not isinstance(payload, dict) or any(payload.get(key) != manifest.get(key) for key in ("schema_version", "pipeline_version", "job_id", "input_sha256")):
+            raise PipelineError("O snapshot da revisão pertence a outro projeto, mídia ou pipeline.")
+        payloads[role] = payload
+    snapshot, review = payloads["source"], payloads["approved"]
+    source_language = snapshot.get("source_language")
+    if not isinstance(source_language, str) or not re.fullmatch(r"[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*", source_language) or review.get("source_language") != source_language:
+        raise PipelineError("O idioma original do snapshot e da revisão é divergente.")
+    requested_source = manifest.get("options", {}).get("source_language", "auto")
+    if requested_source != "auto" and str(requested_source).split("-")[0].lower() != source_language.split("-")[0].lower():
+        raise PipelineError("O snapshot não corresponde ao idioma original configurado.")
+    if review.get("source_snapshot_sha256") != contract["sha256"]:
+        raise PipelineError("A revisão aprovada não está vinculada ao snapshot original.")
+    source_segments = snapshot.get("segments")
+    if not isinstance(source_segments, list) or not source_segments or len(source_segments) > 20000:
+        raise PipelineError("O snapshot não contém todos os trechos originais.")
+    previous, seen = -1.0, set()
+    for segment in source_segments:
+        if not isinstance(segment, dict):
+            raise PipelineError("Um trecho do snapshot é inválido.")
+        if isinstance(segment.get("id"), bool) or not isinstance(segment.get("id"), (int, str)):
+            raise PipelineError("Identificador de trecho do snapshot inválido.")
+        identity = (type(segment["id"]).__name__, str(segment["id"]))
+        if identity in seen:
+            raise PipelineError("O snapshot contém identificadores de trecho repetidos.")
+        seen.add(identity)
+        try:
+            if any(isinstance(segment.get(key), bool) or not isinstance(segment.get(key), (int, float)) for key in ("start", "end")):
+                raise ValueError()
+            start, end = float(segment["start"]), float(segment["end"])
+        except (ValueError, TypeError, KeyError) as exc:
+            raise PipelineError("Os tempos do snapshot são inválidos.") from exc
+        if not math.isfinite(start) or not math.isfinite(end) or start < previous or start < 0 or end <= start or end > duration + 1.0:
+            raise PipelineError("Os tempos do snapshot não correspondem aos limites da mídia.")
+        previous = start
+        if not isinstance(segment.get("speaker"), str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", segment["speaker"]):
+            raise PipelineError("O snapshot possui locutor inválido.")
+        if not isinstance(segment.get("text"), str) or not segment["text"].strip():
+            raise PipelineError("O snapshot possui texto original vazio.")
+    translations = validate_review(review, manifest, source_segments)
+    for items in translations.values():
+        for original, revised in zip(source_segments, items):
+            if any(isinstance(revised.get(key), bool) or not isinstance(revised.get(key), (int, float)) for key in ("start", "end")) or any(revised.get(key) != original.get(key) for key in ("id", "start", "end", "speaker", "text")):
+                raise PipelineError("A revisão alterou a transcrição congelada; somente a tradução pode ser editada.")
+    return {"source": snapshot, "translations": translations, "source_sha256": contract["sha256"]}
 
 
 def run_command(command: list[str], log: Path | None = None) -> None:
@@ -192,6 +266,11 @@ class StageCache:
         self.worker_code = worker_fingerprint()
 
     def persist(self) -> None:
+        source_root, storage_root = self.root.resolve(), self.storage.resolve()
+        if source_root == storage_root:
+            return  # No Drive: the local job is already its own checkpoint.
+        if source_root.is_relative_to(storage_root) or storage_root.is_relative_to(source_root):
+            raise PipelineError("Origem e destino dos checkpoints não podem ficar um dentro do outro.")
         # Checkpoint files may change without changing size (edited translations).
         # Track local stat changes instead of rehashing GBs of video after every stage.
         for file in self.root.rglob("*"):
@@ -285,6 +364,48 @@ def tempo_filters(ratio: float) -> str:
     return ",".join(f"atempo={value:.8f}" for value in factors)
 
 
+def fit_voice_to_frames(raw: Path, adjusted: Path, ratio: float, available_frames: int, sample_rate: int = 48000) -> float:
+    """Re-encode the entire utterance; never trim an overrun to fit a window."""
+    if available_frames <= 0:
+        raise PipelineError("Não há espaço na linha do tempo para a fala completa.")
+    initial_ratio = ratio
+    for attempt in range(3):
+        run_command(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw),
+                     "-af", tempo_filters(ratio), "-ac", "2", "-ar", str(sample_rate),
+                     "-c:a", "pcm_s16le", str(adjusted)])
+        with wave.open(str(adjusted), "rb") as rendered:
+            if rendered.getframerate() != sample_rate:
+                raise PipelineError("A fala renderizada está em uma taxa de áudio inesperada.")
+            frames = rendered.getnframes()
+        if 0 < frames <= available_frames:
+            return ratio
+        if frames <= 0:
+            raise PipelineError("A fala ajustada está vazia.")
+        # FFmpeg atempo may round a few samples beyond its requested duration.
+        # Retry from the untouched full utterance, with a bounded correction.
+        ratio *= frames / available_frames * 1.002
+        if ratio > initial_ratio * 1.05:
+            break
+    raise PipelineError("A fala completa ainda excede a janela; exportação recusada para não cortar seu final.")
+
+
+def tts_segments_for_frames(segments: list[dict], frame_counts: list[int], sample_rate: int = 48000, pause_frames: int = 8640) -> list[dict]:
+    """Derive TTS timestamps from rendered samples, including inter-phrase pauses."""
+    if not segments or len(segments) != len(frame_counts) or sample_rate <= 0 or pause_frames < 0:
+        raise PipelineError("A linha do tempo da voz gerada está incompleta.")
+    rendered, cursor = [], 0
+    for index, (segment, frames) in enumerate(zip(segments, frame_counts)):
+        if not isinstance(frames, int) or isinstance(frames, bool) or frames <= 0:
+            raise PipelineError("Uma fala gerada não possui amostras válidas.")
+        if index:
+            cursor += pause_frames
+        emitted = copy.deepcopy(segment)
+        emitted.update(start=cursor / sample_rate, end=(cursor + frames) / sample_rate)
+        rendered.append(emitted)
+        cursor += frames
+    return rendered
+
+
 def validate_voice_reference(file: Path) -> dict:
     """Reject silence/music-only prompts before downloading the synthesis model.
 
@@ -345,7 +466,7 @@ def synthesize_stage(config: dict, legacy) -> None:
             sf.write(raw, array, model.sr)
             actual = media_info(raw)["duration"]
             if timeline is None:
-                generated.append(AudioSegment.from_wav(raw))
+                generated.append(AudioSegment.from_wav(raw).set_frame_rate(48000).set_channels(2))
                 continue
             slot = duration_slot(segments, index, duration)
             speaking_time = max(0.15, float(item["end"]) - float(item["start"]))
@@ -355,11 +476,14 @@ def synthesize_stage(config: dict, legacy) -> None:
                 raise PipelineError(f"A tradução do segmento {item['id']} é longa demais para a cena. Revise/encurte esse texto e retome o projeto.")
             ratio = max(1.0, actual / min(slot, speaking_time))
             adjusted = directory / f"voice-fitted-{index:04d}.wav"
-            run_command(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw), "-af", tempo_filters(ratio), "-ac", "2", "-ar", "48000", str(adjusted)])
+            position_ms = round(float(item["start"]) * 1000)
+            position_frames = position_ms * 48
+            available_frames = min(int(slot * 48000), int(timeline.frame_count()) - position_frames)
+            ratio = fit_voice_to_frames(raw, adjusted, ratio, available_frames)
             clip = AudioSegment.from_wav(adjusted)
-            if len(clip) > round(slot * 1000) + 80:
+            if int(clip.frame_count()) > available_frames:
                 raise PipelineError(f"A fala {item['id']} excede a janela e seria cortada; exportação recusada.")
-            timeline = timeline.overlay(clip, position=round(float(item["start"]) * 1000))
+            timeline = timeline.overlay(clip, position=position_ms)
             adjustments.append({"segment_id": item["id"], "factor": round(ratio, 4), "speech_seconds": actual, "rendered_seconds": len(clip) / 1000, "slot_seconds": slot})
             item["speed"] = ratio
         if timeline is None:
@@ -367,7 +491,10 @@ def synthesize_stage(config: dict, legacy) -> None:
                 raise PipelineError("Nenhuma fala gerada.")
             timeline = generated[0]
             for clip in generated[1:]:
-                timeline += AudioSegment.silent(duration=180) + clip
+                timeline += AudioSegment.silent(duration=180, frame_rate=48000).set_channels(2) + clip
+            rendered_segments = tts_segments_for_frames(segments, [int(clip.frame_count()) for clip in generated])
+            write_json(directory / "voice-segments.json", {"target_language": config["language"], "segments": rendered_segments})
+            segments = rendered_segments
         timeline.export(directory / "dialogue.wav", format="wav")
         write_json(directory / "voice-proof.json", {"voice_engine": "Chatterbox Multilingual 0.1.7", "voice_clone": {"required": True, "confirmed": True, "authorized": True}, "references": {key: sha256(file) for key, file in references.items()}, "reference_validation": reference_validation, "timing_adjustments": adjustments, "segments": segments})
     finally:
@@ -749,6 +876,7 @@ def process(package: Path, work_root: Path, storage: Path, output: Path) -> dict
     duration = media_info(video)["duration"] if video else 0.0
     if video and (duration <= 0 or duration > 1200):
         raise PipelineError("Vídeos precisam ter duração entre zero e vinte minutos.")
+    approved_snapshot = load_approved_snapshot(package, manifest, duration)
     diarization = shared / "diarization.json"
     analysis = shared / "active-speaker.json"
     references = shared / "references.json"
@@ -756,8 +884,16 @@ def process(package: Path, work_root: Path, storage: Path, output: Path) -> dict
     started = time.time()
     if operation == "dub_video":
         cache.stage("separation", "Separação de áudio na GPU", {**base_config, "stage": "separation", "video": str(video)}, [shared / "vocals.wav", shared / "background.wav"])
-        cache.stage("asr", "Transcrição na GPU", {**base_config, "stage": "asr", "vocals": str(shared / "vocals.wav"), "source_language": source_language, "profile": options.get("performance_profile", "fast_lipsync"), "output": str(shared / "transcript.json")}, [shared / "transcript.json"])
-        cache.stage("diarization", "Identificação de locutores", {**base_config, "stage": "diarization", "vocals": str(shared / "vocals.wav"), "transcript": str(shared / "transcript.json"), "transcript_hash": sha256(shared / "transcript.json"), "speaker_count": options.get("speaker_count", "auto"), "output": str(diarization)}, [diarization])
+        if approved_snapshot:
+            frozen = approved_snapshot["source"]
+            write_json(diarization, {"segments": frozen["segments"], "language": frozen["source_language"],
+                                     "approved_source_snapshot_sha256": approved_snapshot["source_sha256"]})
+            cache.used["approved_source_snapshot"] = True
+            cache.seconds["approved_source_snapshot"] = 0.0
+            print("Transcrição aprovada preservada: ASR e identificação de locutores não serão refeitas.", flush=True)
+        else:
+            cache.stage("asr", "Transcrição na GPU", {**base_config, "stage": "asr", "vocals": str(shared / "vocals.wav"), "source_language": source_language, "profile": options.get("performance_profile", "fast_lipsync"), "output": str(shared / "transcript.json")}, [shared / "transcript.json"])
+            cache.stage("diarization", "Identificação de locutores", {**base_config, "stage": "diarization", "vocals": str(shared / "vocals.wav"), "transcript": str(shared / "transcript.json"), "transcript_hash": sha256(shared / "transcript.json"), "speaker_count": options.get("speaker_count", "auto"), "output": str(diarization)}, [diarization])
         source_language = read_json(diarization)["language"]
         reference_files = [shared / f"reference-{speaker}.wav" for speaker in sorted({item["speaker"] for item in read_json(diarization)["segments"]})]
         cache.stage("references", "Referências do timbre original", {**base_config, "stage": "references", "vocals": str(shared / "vocals.wav"), "segments": str(diarization), "segments_hash": sha256(diarization), "reference": str(inputs["reference"]) if "reference" in inputs else None, "reference_hash": sha256(inputs["reference"]) if "reference" in inputs else None, "output": str(references)}, [references, *reference_files])
@@ -777,7 +913,7 @@ def process(package: Path, work_root: Path, storage: Path, output: Path) -> dict
             raise PipelineError("O áudio enviado excede a duração do vídeo e seria cortado. Ajuste os arquivos antes de continuar.")
         write_json(diarization, {"segments": [], "language": source_language})
     source_segments = read_json(diarization)["segments"]
-    approved = validate_review(read_json(package / "review-approved.json"), manifest, source_segments) if (package / "review-approved.json").exists() else None
+    approved = approved_snapshot["translations"] if approved_snapshot else None
     translations = {}
     translation_errors = {}
     review_required = options.get("review_mode") in {True, "before_voice", "before_synthesis", "manual", "required"}
@@ -824,7 +960,10 @@ def process(package: Path, work_root: Path, storage: Path, output: Path) -> dict
                 write_json(translated, {"target_language": language, "segments": source_segments})
             if operation != "lipsync_video":
                 refs = read_json(references)
-                cache.stage(f"synthesis-{language}", f"Timbre original em {language}", {"directory": str(target), "stage": "synthesis", "identity": identity, "segments": str(translated), "segments_hash": sha256(translated), "references": refs, "reference_hashes": {key: sha256(Path(value)) for key, value in refs.items()}, "language": language, "duration": duration}, [target / "dialogue.wav", target / "voice-proof.json"])
+                synthesis_outputs = [target / "dialogue.wav", target / "voice-proof.json"]
+                if operation == "text_to_voice":
+                    synthesis_outputs.append(target / "voice-segments.json")
+                cache.stage(f"synthesis-{language}", f"Timbre original em {language}", {"directory": str(target), "stage": "synthesis", "identity": identity, "segments": str(translated), "segments_hash": sha256(translated), "references": refs, "reference_hashes": {key: sha256(Path(value)) for key, value in refs.items()}, "language": language, "duration": duration}, synthesis_outputs)
                 report.update(read_json(target / "voice-proof.json"))
                 audio = target / "dialogue.wav"
                 if video:
@@ -861,7 +1000,7 @@ def process(package: Path, work_root: Path, storage: Path, output: Path) -> dict
             if operation == "dub_video":
                 files.update(segments=translated, original_srt=target / "original.srt", translation_srt=target / "translation.srt")
             elif operation == "text_to_voice":
-                files["segments"] = translated
+                files["segments"] = target / "voice-segments.json"
             report.update(finished_at=int(time.time()), cache=cache.used, stages_seconds=cache.seconds, gpu_activity=cache.gpu_activity, metrics={"processing_seconds": round(time.time() - started, 3)})
             write_json(target / "report.json", report)
             files["report"] = target / "report.json"

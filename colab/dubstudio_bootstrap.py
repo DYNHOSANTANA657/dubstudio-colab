@@ -14,12 +14,13 @@ import os
 import shutil
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 PIPELINE_VERSION = "3.0.0"
 MUSE_COMMIT = "0a89dec45a0192b824e3cf4daf96c239440c5ed8"
 TALKNET_COMMIT = "6d6821479af485e251c4991487e40573b42181b4"
 PERTH_COMMIT = "ff1c8ac55a976971245cdd53c18d6131ca00d993"
+CACHE_LINKS_FILE = ".dubstudio-cache-links.json"
 
 
 def execute(command: list[str], *, cwd: Path | None = None, env: dict | None = None) -> None:
@@ -46,28 +47,146 @@ def file_digest(file: Path) -> bytes:
     return digest.digest()
 
 
-def copy_missing(source: Path, destination: Path, *, verify: bool = False) -> None:
-    """Mirror incremental: ambientes executáveis jamais são copiados do Drive."""
+def _mirror_roots(source: Path, destination: Path) -> bool:
+    """No self-copy or recursively nested mirrors, including path aliases."""
+    source_root, destination_root = source.resolve(), destination.resolve()
+    if source_root == destination_root:
+        return False
+    if source_root.is_relative_to(destination_root) or destination_root.is_relative_to(source_root):
+        raise RuntimeError("Origem e destino do cache não podem ficar um dentro do outro.")
+    return True
+
+
+def _cache_path(root: Path, relative: str) -> Path:
+    """Validate lexical paths and existing parent directories without following the leaf."""
+    if not isinstance(relative, str) or not relative or any(char in relative for char in ("\\", ":", "\x00")):
+        raise RuntimeError("O cache contém metadados de link com caminho inválido.")
+    path = PurePosixPath(relative)
+    if path.is_absolute() or not path.parts or ".." in path.parts or str(path) == ".":
+        raise RuntimeError("O cache contém metadados de link fora do diretório autorizado.")
+    target = root.joinpath(*path.parts)
+    if not target.parent.resolve().is_relative_to(root.resolve()):
+        raise RuntimeError("O cache contém diretório apontando para fora do cache autorizado.")
+    return target
+
+
+def _read_cache_links(root: Path) -> dict[str, str]:
+    metadata = root / CACHE_LINKS_FILE
+    if not metadata.exists():
+        return {}
+    if metadata.is_symlink() or metadata.stat().st_size > 1024 * 1024:
+        raise RuntimeError("Metadados de links do cache inválidos.")
+    try:
+        payload = json.loads(metadata.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as exc:
+        raise RuntimeError("Não foi possível validar os links persistidos do cache.") from exc
+    links = payload.get("links") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1 or not isinstance(links, dict) or len(links) > 10000:
+        raise RuntimeError("Formato de links persistidos do cache inválido.")
+    for relative, reference in links.items():
+        link = _cache_path(root, relative)
+        canonical = _cache_path(root, reference)
+        if relative == CACHE_LINKS_FILE or reference == CACHE_LINKS_FILE or relative == reference:
+            raise RuntimeError("O cache contém referência circular ou reservada.")
+        if not canonical.is_file() or not canonical.resolve().is_relative_to(root.resolve()):
+            raise RuntimeError("O link persistido não referencia um arquivo do cache autorizado.")
+        if link.exists() and not link.is_symlink():
+            raise RuntimeError("Os metadados de cache conflitam com um arquivo real.")
+    return links
+
+
+def _copy_regular_file(file: Path, target: Path, *, verify: bool) -> None:
+    if target.is_symlink() or (target.exists() and not target.is_file()):
+        raise RuntimeError("O destino do cache não pode ser um link ou diretório inesperado.")
+    if target.exists() and target.stat().st_size == file.stat().st_size:
+        if not verify or file_digest(target) == file_digest(file):
+            return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".copying")
+    if temporary.is_symlink() or (temporary.exists() and not temporary.is_file()):
+        raise RuntimeError("Arquivo temporário do cache inseguro.")
+    shutil.copy2(file, temporary)
+    temporary.replace(target)
+
+
+def _write_cache_links(root: Path, links: dict[str, str]) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / CACHE_LINKS_FILE
+    temporary = target.with_name(target.name + ".writing")
+    if target.is_symlink() or temporary.is_symlink():
+        raise RuntimeError("Arquivo de metadados do cache inseguro.")
+    temporary.write_text(json.dumps({"schema_version": 1, "links": links}, sort_keys=True), encoding="utf-8")
+    temporary.replace(target)
+
+
+def _restore_cache_link(root: Path, relative: str, reference: str) -> None:
+    target, canonical = _cache_path(root, relative), _cache_path(root, reference)
+    if not canonical.is_file() or not canonical.resolve().is_relative_to(root.resolve()):
+        raise RuntimeError("O arquivo real do cache precisa existir antes de restaurar o link.")
+    if target.is_symlink() and target.resolve() == canonical.resolve():
+        return
+    duplicate = target.exists() and not target.is_symlink()
+    if duplicate and (not target.is_file() or file_digest(target) != file_digest(canonical)):
+        raise RuntimeError("O snapshot existente diverge do arquivo real do cache.")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".link-writing")
+    if temporary.exists() or temporary.is_symlink():
+        raise RuntimeError("Já existe um arquivo temporário de link no cache.")
+    try:
+        temporary.symlink_to(os.path.relpath(canonical, target.parent))
+    except OSError:
+        # Google Drive/FUSE and non-privileged Windows may not support symlinks.
+        # The root metadata is authoritative: never materialize another copy of
+        # a multi-GB snapshot. Local restoration recreates its relative link.
+        if target.is_symlink():
+            target.unlink()
+        elif duplicate:
+            target.unlink()  # Remove only an independently verified cache duplicate.
+        return
+    temporary.replace(target)
+
+
+def copy_missing(source: Path, destination: Path, *, verify: bool = False, preserve_cache_links: bool = False) -> None:
+    """Incremental mirror; cache snapshots store references, never duplicate blobs."""
+    if not _mirror_roots(source, destination):
+        return
     if not source.exists():
         return
+    links = _read_cache_links(source) if preserve_cache_links else {}
+    saved_links = _read_cache_links(destination) if preserve_cache_links else {}
+    files = []
     for file in source.rglob("*"):
-        if not file.is_file() or file.name.endswith((".lock", ".incomplete")):
+        if file.name.endswith((".lock", ".incomplete", ".copying", ".writing", ".link-writing")):
             continue
-        target = destination / file.relative_to(source)
-        if target.exists() and target.stat().st_size == file.stat().st_size:
-            if not verify or file_digest(target) == file_digest(file):
-                continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temporary = target.with_name(target.name + ".copying")
-        shutil.copy2(file, temporary)
-        temporary.replace(target)
+        relative = file.relative_to(source).as_posix()
+        if preserve_cache_links and relative == CACHE_LINKS_FILE:
+            continue
+        if file.is_symlink():
+            canonical = file.resolve()
+            if not preserve_cache_links or not canonical.is_file() or not canonical.is_relative_to(source.resolve()):
+                raise RuntimeError("O cache contém link fora do diretório de arquivos autorizado.")
+            links[relative] = canonical.relative_to(source.resolve()).as_posix()
+        elif file.is_file():
+            files.append((file, relative))
+    # Validate all source links before copying anything; parent symlinks cannot
+    # redirect writes outside the destination, even in a previously saved cache.
+    for relative, reference in links.items():
+        _cache_path(destination, relative)
+        _cache_path(destination, reference)
+    for file, relative in files:
+        _copy_regular_file(file, _cache_path(destination, relative), verify=verify)
+    if preserve_cache_links and (links or saved_links):
+        saved_links.update(links)
+        for relative, reference in saved_links.items():
+            _restore_cache_link(destination, relative, reference)
+        _write_cache_links(destination, saved_links)
 
 
 def persist_cache(runtime: Path, storage: Path) -> None:
     if runtime.resolve() == storage.resolve():
         return
     for name in ("cache", "models"):
-        copy_missing(runtime / name, storage / name)
+        copy_missing(runtime / name, storage / name, preserve_cache_links=name == "cache")
 
 
 def clone_at(repository: str, destination: Path, revision: str) -> None:
@@ -112,7 +231,7 @@ def prepare(runtime: Path, storage: Path, needs_lipsync: bool = True) -> dict:
         raise RuntimeError("São necessários pelo menos 15 GB livres no runtime para preparar os modelos.")
     print(f"GPU concedida: {gpu}\nRestaurando cache local…", flush=True)
     for directory in ("cache", "models"):
-        copy_missing(storage / directory, runtime / directory)
+        copy_missing(storage / directory, runtime / directory, preserve_cache_links=directory == "cache")
     if not shutil.which("ffmpeg") or not shutil.which("git"):
         execute(["apt-get", "update", "-qq"])
         execute(["apt-get", "install", "-y", "-qq", "ffmpeg", "git", "libgl1", "libglib2.0-0"])
