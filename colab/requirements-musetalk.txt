@@ -1,0 +1,21 @@
+# MuseTalk 1.5 fica isolado do Transformers usado pelo Chatterbox.
+numpy==1.24.4
+opencv-python-headless==4.8.1.78
+diffusers==0.30.2
+accelerate==0.28.0
+soundfile==0.12.1
+transformers==4.39.2
+huggingface_hub==0.30.2
+librosa==0.11.0
+einops==0.8.1
+omegaconf==2.3.0
+imageio==2.37.0
+imageio-ffmpeg==0.6.0
+ffmpeg-python==0.2.0
+moviepy==1.0.3
+tqdm==4.67.1
+sentencepiece==0.2.1
+openmim==0.3.9
+json_tricks==3.17.3
+munkres==1.1.4
+xtcocotools==1.14.3
