@@ -1,0 +1,17 @@
+runtime/
+*.zip
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.wav
+*.mp3
+*.m4a
+*.jpg
+*.png
+__pycache__/
+*.pyc
+.test-temp/
+validation-colab/
+server_runpod_legacy.py
+README_LEGADO.md

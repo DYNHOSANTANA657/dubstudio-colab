@@ -1,0 +1,18 @@
+{
+  "studio_schema_version": 2,
+  "limits": {
+    "max_upload_gb": 8,
+    "max_duration_minutes": 20,
+    "recommended_duration_minutes": 2
+  },
+  "colab": {
+    "notebook_url": "https://colab.research.google.com/github/DYNHOSANTANA657/dubstudio-colab/blob/main/DubStudio_Colab.ipynb"
+  },
+  "studio": {
+    "performance_profile": "fast_lipsync",
+    "preserve_ambience": true,
+    "review_mode": "before_voice",
+    "cache_on_drive": true,
+    "max_export_resolution": 1080
+  }
+}
