@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path, PurePosixPath
 
 PIPELINE_VERSION = "3.0.0"
@@ -24,7 +25,21 @@ CACHE_LINKS_FILE = ".dubstudio-cache-links.json"
 
 
 def execute(command: list[str], *, cwd: Path | None = None, env: dict | None = None) -> None:
-    subprocess.run(command, cwd=cwd, env=env, check=True)
+    # Report real subprocess boundaries without dumping code, paths or credentials.
+    program = Path(command[0]).name
+    started = time.monotonic()
+    print(f"Ambiente: {program} iniciado…", flush=True)
+    # Jupyter does not reliably surface inherited subprocess stderr. Forward it
+    # explicitly so a failed setup shows its actual cause, not just exit code 1.
+    with subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, text=True, bufsize=1) as process:
+        assert process.stdout is not None
+        for line in process.stdout:
+            print(line.rstrip(), flush=True)
+        returncode = process.wait()
+    if returncode:
+        raise subprocess.CalledProcessError(returncode, command)
+    print(f"Ambiente: {program} concluído em {time.monotonic() - started:.1f}s.", flush=True)
 
 
 def gpu_precheck() -> str:
@@ -190,11 +205,16 @@ def persist_cache(runtime: Path, storage: Path) -> None:
 
 
 def clone_at(repository: str, destination: Path, revision: str) -> None:
-    if not (destination / ".git").exists():
+    created = not (destination / ".git").exists()
+    if created:
         execute(["git", "clone", "--filter=blob:none", "--no-checkout", repository, str(destination)])
     current = subprocess.run(["git", "rev-parse", "HEAD"], cwd=destination, capture_output=True, text=True)
-    if current.returncode or current.stdout.strip() != revision:
+    different_revision = current.returncode or current.stdout.strip() != revision
+    if different_revision:
         execute(["git", "fetch", "--depth", "1", "origin", revision], cwd=destination)
+    # --no-checkout can leave HEAD at the requested revision but no code/index.
+    # Repair only that unmaterialized state; keep runtime patches on valid clones.
+    if created or different_revision or not (destination / ".git/index").is_file():
         execute(["git", "checkout", "--detach", revision], cwd=destination)
 
 
@@ -214,12 +234,36 @@ def environment(runtime: Path) -> dict[str, str]:
         "PYTHONUNBUFFERED": "1",
         "TOKENIZERS_PARALLELISM": "false",
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "DUBSTUDIO_DRIVER_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH", ""),
+        "DUBSTUDIO_SYSTEM_PATH": os.environ.get("PATH", ""),
     })
     torch_lib = runtime / "app-env/lib/python3.10/site-packages/torch/lib"
     cuda_libs = runtime / "app-env/lib/python3.10/site-packages/nvidia"
     libraries = [str(torch_lib)] + [str(path / "lib") for path in cuda_libs.glob("*") if (path / "lib").exists()]
     values["LD_LIBRARY_PATH"] = ":".join(libraries + [values.get("LD_LIBRARY_PATH", "")])
     values["PATH"] = str(runtime / "app-env/bin") + ":" + values.get("PATH", "")
+    return values
+
+
+def musetalk_environment(runtime: Path, inherited: dict | None = None) -> dict[str, str]:
+    """Muse CUDA libraries plus native driver paths, never app CUDA libraries."""
+    values = dict(os.environ if inherited is None else inherited)
+    muse = runtime / "musetalk-env"
+    app = str(runtime / "app-env")
+    library_root = muse / "lib/python3.10/site-packages"
+    libraries = [str(library_root / "torch/lib")]
+    libraries.extend(str(path / "lib") for path in (library_root / "nvidia").glob("*") if (path / "lib").exists())
+    native = values.get("DUBSTUDIO_DRIVER_LIBRARY_PATH", values.get("LD_LIBRARY_PATH", ""))
+    libraries.extend(path for path in native.split(":") if path and not path.startswith(app))
+    values["LD_LIBRARY_PATH"] = ":".join(libraries)
+    original_path = values.get("DUBSTUDIO_SYSTEM_PATH", values.get("PATH", ""))
+    # Idempotent when this helper is reused after setup. Remove entire prefixes
+    # before splitting so mocked Windows drive letters are not split in tests.
+    for environment_bin in (runtime / "app-env/bin", muse / "bin"):
+        original_path = original_path.replace(str(environment_bin) + ":", "")
+    values["PATH"] = ":".join([str(muse / "bin")] + [path for path in original_path.split(":") if path and not path.startswith(app)])
+    values["PYTHONNOUSERSITE"] = "1"
+    values.pop("PYTORCH_CUDA_ALLOC_CONF", None)
     return values
 
 
@@ -257,24 +301,35 @@ def prepare(runtime: Path, storage: Path, needs_lipsync: bool = True) -> dict:
         print("Ambiente de dublagem já preparado nesta sessão.", flush=True)
     values = environment(runtime)
     if needs_lipsync:
+        print("Conferindo repositórios e ambiente isolado de lip-sync…", flush=True)
         muse = runtime / "musetalk-env"
         requirements = Path(__file__).parent / "requirements-musetalk.txt"
+        muse_values = musetalk_environment(runtime, values)
+        # mim starts additional pip resolutions. Keep its transitive installs
+        # within the same NumPy/OpenCV ABI and this isolated Python runtime.
+        muse_values["PIP_CONSTRAINT"] = str(requirements.resolve())
         fingerprint = hashlib.sha256(requirements.read_bytes() + MUSE_COMMIT.encode()).hexdigest()
         marker = muse / ".ready.json"
         ready = marker.exists() and json.loads(marker.read_text()).get("fingerprint") == fingerprint
         clone_at("https://github.com/TMElyralab/MuseTalk.git", runtime / "MuseTalk", MUSE_COMMIT)
         clone_at("https://github.com/TaoRuijie/TalkNet-ASD.git", runtime / "TalkNet-ASD", TALKNET_COMMIT)
         if not ready:
+            print("Instalando dependências do MuseTalk nesta sessão…", flush=True)
             if not (muse / "bin/python").exists():
                 execute(["uv", "venv", "--seed", "--python", "3.10", str(muse)])
             pip = [str(muse / "bin/python"), "-m", "pip"]
-            execute(pip + ["install", "--quiet", "pip==25.2", "wheel==0.45.1", "setuptools==80.9.0"])
-            execute(pip + ["install", "--quiet", "torch==2.0.1", "torchvision==0.15.2", "torchaudio==2.0.2", "--index-url", "https://download.pytorch.org/whl/cu118"])
-            execute(pip + ["install", "--quiet", "-r", str(requirements)])
-            execute([str(muse / "bin/mim"), "install", "mmengine==0.10.7"])
-            execute([str(muse / "bin/mim"), "install", "mmcv==2.0.1"])
-            execute([str(muse / "bin/mim"), "install", "mmdet==3.1.0"])
-            execute(pip + ["install", "--quiet", "--no-deps", "mmpose==1.1.0"])
+            execute(pip + ["install", "--quiet", "pip==25.2", "wheel==0.45.1", "setuptools==80.9.0"], env=muse_values)
+            execute(pip + ["install", "--quiet", "torch==2.0.1", "torchvision==0.15.2", "torchaudio==2.0.2", "--index-url", "https://download.pytorch.org/whl/cu118"], env=muse_values)
+            execute(pip + ["install", "--quiet", "-r", str(requirements)], env=muse_values)
+            execute([str(muse / "bin/mim"), "install", "mmengine==0.10.7"], env=muse_values)
+            execute([str(muse / "bin/mim"), "install", "mmcv==2.0.1"], env=muse_values)
+            execute([str(muse / "bin/mim"), "install", "mmdet==3.1.0"], env=muse_values)
+            execute(pip + ["install", "--quiet", "--no-deps", "mmpose==1.1.0"], env=muse_values)
+            # Chumpy's official legacy setup imports pip; isolated PEP517 builds
+            # cannot build it. Runtime aliases also require NumPy < 1.24.
+            execute(pip + ["install", "--quiet", "--no-build-isolation", "--no-deps", "chumpy==0.70"], env=muse_values)
+            execute(pip + ["check"], env=muse_values)
+        print("Conferindo e baixando somente pesos faciais ausentes…", flush=True)
         download_model_weights(runtime, values)
         # Use local models for computation. Drive contains only persisted copies.
         model_link = runtime / "MuseTalk/models"
@@ -285,9 +340,8 @@ def prepare(runtime: Path, storage: Path, needs_lipsync: bool = True) -> dict:
                 model_link.rename(runtime / "MuseTalk/models-repository")
             model_link.symlink_to(runtime / "models/musetalk", target_is_directory=True)
         if not ready:
-            muse_values = values.copy()
-            muse_values.pop("PYTORCH_CUDA_ALLOC_CONF", None)
-            muse_values["LD_LIBRARY_PATH"] = str(muse / "lib/python3.10/site-packages/torch/lib")
+            # Include CUDA libraries installed during the preceding pip steps.
+            muse_values = musetalk_environment(runtime, muse_values)
             execute([str(muse / "bin/python"), "-c", "import torch,cv2,numpy; from musetalk.utils.audio_processor import AudioProcessor; from musetalk.utils.preprocessing import get_landmark_and_bbox; from musetalk.utils.face_parsing import FaceParsing; assert torch.cuda.is_available(); print('Imports/GPU de MuseTalk OK')"], cwd=runtime / "MuseTalk", env=muse_values)
             marker.write_text(json.dumps({"fingerprint": fingerprint, "pipeline_version": PIPELINE_VERSION}))
         else:

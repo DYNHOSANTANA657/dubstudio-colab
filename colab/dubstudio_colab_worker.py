@@ -118,7 +118,52 @@ def run_streaming(
     result = subprocess.CompletedProcess(command, returncode, "".join(chunks), "")
     if result.returncode:
         raise WorkerError(f"Comando falhou ({result.returncode}): {result.stdout[-3000:]}")
+    if "scripts.inference" in command:
+        failure = musetalk_failure_detail(result.stdout)
+        if failure:
+            # MuseTalk catches task exceptions and can still exit zero. Raise
+            # here, inside the runner's low-memory wrapper, to allow batch 1.
+            raise WorkerError(f"MuseTalk declarou falha apesar de retornar zero: {failure}")
     return result
+
+
+def musetalk_failure_detail(output: str) -> str:
+    failure_lines = [
+        line.strip() for line in output.splitlines()
+        if any(marker in line.lower() for marker in (
+            "error occurred during processing:", "traceback (most recent call last):", "out of memory",
+        ))
+    ]
+    if not failure_lines:
+        return ""
+    tail = output[-3000:].strip()
+    cause = "\n".join(line for line in failure_lines[-3:] if line not in tail)
+    return "\n".join(part for part in (cause, tail) if part)
+
+
+def select_musetalk_output(
+    result_dir: Path,
+    before: set[Path],
+    result: subprocess.CompletedProcess,
+    failure_message: str,
+) -> Path:
+    """Do not treat MuseTalk's swallowed task exception or old MP4 as success."""
+    output = getattr(result, "stdout", "") or ""
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", errors="replace")
+    elif not isinstance(output, str):
+        output = str(output)
+    # The pinned official CLI catches task exceptions, prints them, and exits
+    # zero. Preserve those diagnostics so the caller can retry GPU OOM safely.
+    failure = musetalk_failure_detail(output)
+    candidates = [
+        path for path in result_dir.rglob("*.mp4")
+        if path.resolve() not in before and path.is_file() and path.stat().st_size > 0
+    ]
+    if not candidates or failure or getattr(result, "returncode", 0):
+        detail = failure or output[-3000:].strip()
+        raise WorkerError(f"{failure_message}{' Saída do MuseTalk: ' + detail if detail else ''}")
+    return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
 def sha256(path: Path) -> str:
@@ -1448,11 +1493,8 @@ def render_confirmed_face_segment(
             write_progress(job_dir, target, "Aplicando lip-sync", message)
 
     os.environ["MPLBACKEND"] = "Agg"
-    run_streaming(command, cwd=root, log=log, on_output=report_musetalk_progress)
-    candidates = [path for path in result_dir.rglob("*.mp4") if path.resolve() not in before and path.stat().st_size > 0]
-    if not candidates:
-        raise WorkerError("MuseTalk não criou o trecho facial esperado.")
-    rendered = max(candidates, key=lambda path: path.stat().st_mtime)
+    result = run_streaming(command, cwd=root, log=log, on_output=report_musetalk_progress)
+    rendered = select_musetalk_output(result_dir, before, result, "MuseTalk não criou o trecho facial esperado.")
     assert_video_stream_coverage(rendered, segment_video)
     composed = compose_confirmed_face_segment(rendered, video, segment_duration, job_dir, log)
     source_duration = video_stream_duration(video)
@@ -1610,11 +1652,8 @@ def render_confirmed_talknet_segments(
         if fast_profile:
             command.extend(["--use_float16", "--batch_size", "24"])
         write_progress(job_dir, 82, "Aplicando lip-sync", f"Sincronizando rosto confirmado {index} de {total}")
-        run_streaming(command, cwd=root, log=log)
-        candidates = [path for path in result_dir.rglob("*.mp4") if path.resolve() not in before and path.stat().st_size > 0]
-        if not candidates:
-            raise WorkerError(f"MuseTalk não criou o trecho facial {index}.")
-        rendered = max(candidates, key=lambda path: path.stat().st_mtime)
+        result = run_streaming(command, cwd=root, log=log)
+        rendered = select_musetalk_output(result_dir, before, result, f"MuseTalk não criou o trecho facial {index}.")
         assert_video_stream_coverage(rendered, segment_video)
         base_video = compose_face_patch(rendered, base_video, video, start_seconds, segment_duration, index, job_dir, log)
         confirmed_segments.append({"start": round(start_seconds, 3), "end": round(start_seconds + segment_duration, 3)})
@@ -1849,11 +1888,8 @@ def musetalk(
             last_progress = target
             write_progress(job_dir, target, stage, message)
 
-    run_streaming(command, cwd=root, log=log, on_output=report_musetalk_progress)
-    candidates = [path for path in result_dir.rglob("*.mp4") if path.resolve() not in before and path.stat().st_size > 0]
-    if not candidates:
-        raise WorkerError("MuseTalk terminou sem criar o vídeo esperado.")
-    rendered = max(candidates, key=lambda path: path.stat().st_mtime)
+    result = run_streaming(command, cwd=root, log=log, on_output=report_musetalk_progress)
+    rendered = select_musetalk_output(result_dir, before, result, "MuseTalk terminou sem criar o vídeo esperado.")
     assert_video_stream_coverage(rendered, video)
     analysis["musetalk_input"] = {
         "video": musetalk_video.name,

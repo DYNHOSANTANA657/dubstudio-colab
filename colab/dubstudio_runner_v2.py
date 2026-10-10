@@ -256,6 +256,23 @@ def verify_final_media(video: Path, expected_duration: float) -> dict:
     return {"duration": info["duration"], "video_duration": durations["video"], "audio_duration": durations["audio"], "timing_tolerance_seconds": max(abs(value - expected_duration) for value in durations.values()), "audio_channels": int(types["audio"].get("channels", 0))}
 
 
+def input_stream_duration(info: dict, kind: str) -> float:
+    stream = next((item for item in info.get("streams", []) if item.get("codec_type") == kind), {})
+    value = stream.get("duration", info.get("duration", 0))
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        raise PipelineError(f"A duração da faixa de {kind} não é válida.") from None
+    if not math.isfinite(duration) or duration <= 0:
+        raise PipelineError(f"A duração da faixa de {kind} não é válida.")
+    return duration
+
+
+def validate_uploaded_audio_duration(audio_duration: float, video_duration: float) -> None:
+    if not math.isfinite(audio_duration) or audio_duration <= 0 or audio_duration > video_duration + 0.000001:
+        raise PipelineError("O áudio enviado excede a duração da faixa de vídeo e seria cortado. Ajuste os arquivos antes de continuar; nenhuma fala será descartada automaticamente.")
+
+
 class StageCache:
     def __init__(self, root: Path, storage: Path):
         self.root, self.storage = root, storage
@@ -651,7 +668,12 @@ def identity_segments(tracks: list, scores: list, frame_count: int, width: int, 
     for frame in sorted(by_frame):
         track, box = by_frame[frame][0]
         if not groups or frame != groups[-1]["end_frame"] or track != groups[-1]["track_id"]:
-            groups.append({"start_frame": frame, "end_frame": frame + 1, "fps": 25.0, "track_id": track, "boxes": [box], "coordinate_source": "TalkNet com seleção do usuário" if selected_track is not None and track == int(selected_track) else "TalkNet confirmado"})
+            selected = selected_track is not None and track == int(selected_track)
+            external_audio = operation == "lipsync_video"
+            coordinate_source = ("S3FD: rosto detectado com seleção do usuário" if selected else "S3FD: rosto detectado para áudio enviado") if external_audio else ("TalkNet com seleção do usuário" if selected else "TalkNet: rosto falante confirmado")
+            groups.append({"start_frame": frame, "end_frame": frame + 1, "fps": 25.0, "track_id": track, "boxes": [box], "coordinate_source": coordinate_source,
+                           "face_confirmation": "user_selected" if selected else "detected",
+                           "speaker_confirmation": "external_audio" if external_audio else ("user_selected" if selected else "active_speaker")})
         else:
             groups[-1]["end_frame"] += 1
             groups[-1]["boxes"].append(box)
@@ -715,9 +737,9 @@ def stage_main(name: str, config: dict) -> None:
         synthesize_stage(config, legacy)
     elif name == "analysis":
         analysis_video = Path(config["video"])
-        if not any(item.get("codec_type") == "audio" for item in media_info(analysis_video)["streams"]) and config.get("audio"):
+        if config.get("audio"):
             analysis_video = directory / "speaker-analysis-input.mp4"
-            run_command(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", config["video"], "-i", config["audio"], "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-af", "apad", "-t", str(config["duration"]), str(analysis_video)])
+            run_command(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", config["video"], "-i", config["audio"], "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-af", "apad", "-t", str(config["duration"]), str(analysis_video)])
         talknet = Path(os.environ["DUBSTUDIO_TALKNET_ROOT"])
         demo = talknet / "demo"
         demo.mkdir(exist_ok=True)
@@ -755,6 +777,10 @@ def stage_main(name: str, config: dict) -> None:
         transcript = read_json(Path(config["segments"]))["segments"] if config.get("segments") else []
         confirmed, ambiguity = identity_segments(tracks, scores, legacy.video_frame_count(normalized), int(stream["width"]), int(stream["height"]), transcript, config.get("face_selection"), config["operation"])
         analysis.update(confirmed_face_segments=confirmed, ambiguity=ambiguity, safe_for_single_face_lipsync=bool(confirmed) and not ambiguity)
+        if config["operation"] == "dub_video" and isinstance(tracks, list) and not tracks and not ambiguity:
+            # Absence of detected faces is not confirmation of applied lip-sync.
+            analysis.update(no_visible_speaking_face=True,
+                            preserved_no_speaker_visual_segments=[{"start": 0.0, "end": float(config["duration"]), "reason": "Análise completa: nenhum rosto foi detectado; imagem original preservada"}])
         # A local checkpoint carries normalized media needed by the legacy renderer.
         local_normalized = directory / "talknet-normalized.avi"
         shutil.copy2(normalized, local_normalized)
@@ -762,7 +788,7 @@ def stage_main(name: str, config: dict) -> None:
         write_json(Path(config["output"]), analysis)
         if ambiguity:
             raise PipelineError("Rosto/locutor ambíguo. Corrija a seleção ou divisão de cenas; nenhum vídeo sem lip-sync confirmado será entregue.")
-        if not confirmed:
+        if not confirmed and analysis.get("no_visible_speaking_face") is not True:
             raise PipelineError("Nenhum trecho de rosto foi confirmado para lip-sync. Verifique se o vídeo mostra o rosto falante ou selecione o rosto na operação com áudio.")
     elif name == "lipsync":
         analysis = read_json(Path(config["analysis"]))
@@ -774,8 +800,8 @@ def stage_main(name: str, config: dict) -> None:
         shutil.copy2(Path(analysis["normalized_video"]), normalized)
         # Prevent app CUDA libraries from taking precedence over MuseTalk's isolated Torch.
         muse_env = Path(os.environ["DUBSTUDIO_MUSETALK_PYTHON"]).parent.parent
-        os.environ["LD_LIBRARY_PATH"] = str(muse_env / "lib/python3.10/site-packages/torch/lib")
-        os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+        from dubstudio_bootstrap import musetalk_environment
+        os.environ.update(musetalk_environment(muse_env.parent, os.environ))
         # A previous interrupted render must not be mistaken for a newly produced
         # result, nor excluded by the legacy renderer when overwritten in place.
         for result_directory in directory.glob("musetalk-result-*"):
@@ -873,7 +899,7 @@ def process(package: Path, work_root: Path, storage: Path, output: Path) -> dict
     shared.mkdir(exist_ok=True)
     base_config = {"directory": str(shared), "identity": identity}
     video = inputs.get("video")
-    duration = media_info(video)["duration"] if video else 0.0
+    duration = input_stream_duration(media_info(video), "video") if video else 0.0
     if video and (duration <= 0 or duration > 1200):
         raise PipelineError("Vídeos precisam ter duração entre zero e vinte minutos.")
     approved_snapshot = load_approved_snapshot(package, manifest, duration)
@@ -908,9 +934,8 @@ def process(package: Path, work_root: Path, storage: Path, output: Path) -> dict
         if media_info(inputs["reference"])["duration"] < 0.8:
             raise PipelineError("Envie referência vocal com pelo menos um segundo de fala.")
     else:
-        audio_duration = media_info(inputs["audio"])["duration"]
-        if audio_duration <= 0 or audio_duration > duration + 1.0:
-            raise PipelineError("O áudio enviado excede a duração do vídeo e seria cortado. Ajuste os arquivos antes de continuar.")
+        audio_duration = input_stream_duration(media_info(inputs["audio"]), "audio")
+        validate_uploaded_audio_duration(audio_duration, duration)
         write_json(diarization, {"segments": [], "language": source_language})
     source_segments = read_json(diarization)["segments"]
     approved = approved_snapshot["translations"] if approved_snapshot else None
@@ -943,13 +968,15 @@ def process(package: Path, work_root: Path, storage: Path, output: Path) -> dict
     if operation == "dub_video" and not require_lipsync:
         print("Dublagem sem lip-sync: análise facial, TalkNet e MuseTalk não serão executados.", flush=True)
     if video and require_lipsync and (operation != "dub_video" or translations):
-        cache.stage("analysis", "Confirmação dos rostos e locutores", {**base_config, "stage": "analysis", "video": str(video), "audio": str(inputs["audio"]) if operation == "lipsync_video" else None, "duration": duration, "operation": operation, "segments": str(diarization), "segments_hash": sha256(diarization), "face_selection": options.get("face_selection", "auto"), "output": str(analysis)}, [analysis, shared / "talknet-normalized.avi"])
+        cache.stage("analysis", "Confirmação dos rostos e locutores", {**base_config, "stage": "analysis", "video": str(video), "audio": str(inputs["audio"]) if operation == "lipsync_video" else None, "audio_hash": sha256(inputs["audio"]) if operation == "lipsync_video" else None, "duration": duration, "operation": operation, "segments": str(diarization), "segments_hash": sha256(diarization), "face_selection": options.get("face_selection", "auto"), "output": str(analysis)}, [analysis, shared / "talknet-normalized.avi"])
+    visual_analysis = read_json(analysis) if video and require_lipsync and analysis.exists() else {}
+    input_checksums = {role: item["sha256"] for role, item in manifest["inputs"].items()}
     records = []
     for language in manifest["target_languages"]:
         target = directory / "outputs" / language
         target.mkdir(parents=True, exist_ok=True)
         record = {"language": language, "status": "failed", "files": {}, "checksums": {}}
-        report = {"schema_version": SCHEMA_VERSION, **identity, "operation": operation, "target_language": language, "source_language": source_language, "gpu": gpu, "voice_clone": {"required": operation != "lipsync_video", "confirmed": False, "authorized": True}, "lipsync": {"required": require_lipsync, "confirmed": False, "applied": False, "confirmed_segments": [], "ambiguity": []}, "preserved_no_speaker_visual_segments": [], "validation_state": "machine_checks_pending_human_review", "started_at": int(started)}
+        report = {"schema_version": SCHEMA_VERSION, **identity, "operation": operation, "input_checksums": input_checksums, "target_language": language, "source_language": source_language, "gpu": gpu, "voice_clone": {"required": operation != "lipsync_video", "confirmed": False, "authorized": True}, "lipsync": {"required": require_lipsync, "confirmed": False, "applied": False, "confirmed_segments": [], "ambiguity": []}, "preserved_no_speaker_visual_segments": [], "validation_state": "machine_checks_pending_human_review", "started_at": int(started)}
         if operation == "dub_video" and not require_lipsync:
             report["mode_label"] = "Dublagem sem lip-sync"
         try:
@@ -978,15 +1005,23 @@ def process(package: Path, work_root: Path, storage: Path, output: Path) -> dict
             if video:
                 cache.stage(f"mix-{language}", f"Mixagem {language}", {"directory": str(target), "stage": "mix", "identity": identity, "audio": str(audio), "audio_hash": sha256(audio), "duration": duration, "background": str(shared / "background.wav") if operation == "dub_video" else None, "preserve_ambience": bool(options.get("preserve_ambience", True)), "output": str(target / "mix.wav")}, [target / "mix.wav"])
                 synced = video
-                if require_lipsync:
+                if require_lipsync and visual_analysis.get("no_visible_speaking_face") is True:
+                    if operation != "dub_video" or visual_analysis.get("scene_analysis_complete") is not True:
+                        raise PipelineError("A operação de lip-sync com áudio exige ao menos um rosto realmente sincronizado.")
+                    report["lipsync"] = {"required": True, "confirmed": False, "applied": False, "confirmed_segments": [], "ambiguity": [], "no_visible_speaking_face": True, "scene_analysis_complete": True}
+                    report["preserved_no_speaker_visual_segments"] = visual_analysis["preserved_no_speaker_visual_segments"]
+                    report["mode_label"] = "Dublagem com narração; nenhum rosto detectado, lip-sync não aplicável"
+                elif require_lipsync:
                     sync_audio = target / "mix.wav" if operation == "lipsync_video" else audio
                     cache.stage(f"lipsync-{language}", f"Lip-sync {language}", {"directory": str(target), "stage": "lipsync", "identity": identity, "video": str(video), "audio": str(sync_audio), "audio_hash": sha256(sync_audio), "analysis": str(analysis), "analysis_hash": sha256(analysis), "output": str(target / "synced.mp4"), "proof": str(target / "lipsync-proof.json")}, [target / "synced.mp4", target / "lipsync-proof.json"])
                     synced = target / "synced.mp4"
                     proof = read_json(target / "lipsync-proof.json")
                     confirmed = []
                     for face in proof.get("confirmed_face_segments", []):
-                        confirmed.append({"start": face["start_frame"] / face["fps"], "end": face["end_frame"] / face["fps"], "speaker": face.get("speaker", "USER_AUDIO"), "coordinate_source": face.get("coordinate_source", "TalkNet confirmado")})
+                        confirmed.append({"start": face["start_frame"] / face["fps"], "end": face["end_frame"] / face["fps"], "speaker": face.get("speaker", "USER_AUDIO"), "coordinate_source": face["coordinate_source"], "face_confirmation": face.get("face_confirmation"), "speaker_confirmation": face.get("speaker_confirmation")})
                     report["lipsync"] = {"required": True, "confirmed": bool(confirmed) and not proof.get("ambiguity"), "applied": bool(confirmed) and not proof.get("ambiguity"), "confirmed_segments": confirmed, "ambiguity": proof.get("ambiguity", []), "coordinate_source": proof.get("coordinate_source")}
+                    if operation == "lipsync_video":
+                        report["lipsync"]["coordinate_source"] = "S3FD/trilhas faciais para áudio enviado; fala original não confirmada"
                     report["preserved_no_speaker_visual_segments"] = proof.get("preserved_no_speaker_visual_segments", [])
                 cache.stage(f"export-{language}", f"Exportação {language}", {"directory": str(target), "stage": "export", "identity": identity, "video": str(synced), "video_hash": sha256(synced), "audio": str(target / "mix.wav"), "audio_hash": sha256(target / "mix.wav"), "source": str(video), "duration": duration, "subtitle_mode": options.get("subtitle_mode", "none"), "srt": str(target / "translation.srt"), "output": str(target / "video.mp4"), "validation": str(target / "media-validation.json")}, [target / "video.mp4", target / "media-validation.json"])
                 report["summary"] = read_json(target / "media-validation.json")
@@ -1013,7 +1048,7 @@ def process(package: Path, work_root: Path, storage: Path, output: Path) -> dict
             print(f"FALHA {language}: {exc}. Checkpoints preservados; os demais idiomas continuarão.", flush=True)
         records.append(record)
         cache.persist()
-    result = {"schema_version": SCHEMA_VERSION, **identity, "operation": operation, "outputs": records}
+    result = {"schema_version": SCHEMA_VERSION, **identity, "operation": operation, "input_checksums": input_checksums, "outputs": records}
     bundle(directory, output, "result.json", result)
     print(f"RESULTADO={output}", flush=True)
     return result
@@ -1042,13 +1077,17 @@ def main() -> None:
         except Exception as exc:
             manifest = validate_manifest(args.package_root)
             root = args.work_root / manifest["job_id"]
+            failure_identity = {"schema_version": SCHEMA_VERSION, "pipeline_version": PIPELINE_VERSION,
+                                "job_id": manifest["job_id"], "input_sha256": manifest["input_sha256"],
+                                "operation": manifest["operation"],
+                                "input_checksums": {role: item["sha256"] for role, item in manifest["inputs"].items()}}
             records = []
             for language in manifest["target_languages"]:
                 report = root / "outputs" / language / "report.json"
-                write_json(report, {"schema_version": SCHEMA_VERSION, "pipeline_version": PIPELINE_VERSION, "job_id": manifest["job_id"], "input_sha256": manifest["input_sha256"], "target_language": language, "error": str(exc), "status": "failed"})
+                write_json(report, {**failure_identity, "target_language": language, "error": str(exc), "status": "failed"})
                 relative = report.relative_to(root).as_posix()
                 records.append({"language": language, "status": "failed", "error": str(exc), "files": {"report": relative}, "checksums": {relative: sha256(report)}})
-            bundle(root, args.output, "result.json", {"schema_version": SCHEMA_VERSION, "pipeline_version": PIPELINE_VERSION, "job_id": manifest["job_id"], "input_sha256": manifest["input_sha256"], "outputs": records})
+            bundle(root, args.output, "result.json", {**failure_identity, "outputs": records})
             print(f"ERRO_PIPELINE={exc}\nRESULTADO={args.output}", flush=True)
             raise
 

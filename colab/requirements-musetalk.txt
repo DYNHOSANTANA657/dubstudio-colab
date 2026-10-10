@@ -1,6 +1,9 @@
 # MuseTalk 1.5 fica isolado do Transformers usado pelo Chatterbox.
-numpy==1.24.4
-opencv-python-headless==4.8.1.78
+numpy==1.23.5
+opencv-python-headless==4.9.0.80
+# mmcv declares opencv-python, not headless; constrain both to the same ABI.
+opencv-python==4.9.0.80
+tomli==2.2.1
 diffusers==0.30.2
 accelerate==0.28.0
 soundfile==0.12.1
