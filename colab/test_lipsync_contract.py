@@ -182,6 +182,68 @@ class LipSyncOrchestrationTests(unittest.TestCase):
         self.assertEqual(record["checksums"][relative], runner.sha256(work / self.manifest["job_id"] / relative))
 
 
+class MuseRuntimeEnvironmentTests(unittest.TestCase):
+    def test_lipsync_stage_removes_app_allocator_and_preserves_native_driver(self):
+        # Exercise the stage's real os.environ boundary, not only the helper's
+        # returned dict. No model, subprocess, or GPU is started by this fixture.
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent,
+                                         prefix=".test-muse-runtime-") as temporary:
+            root = Path(temporary)
+            runtime = root / "runtime"
+            muse = runtime / "musetalk-env"
+            cuda_library = muse / "lib/python3.10/site-packages/nvidia/cuda_runtime/lib"
+            cuda_library.mkdir(parents=True)
+            directory = root / "lipsync"
+            directory.mkdir()
+            normalized = root / "talknet-normalized.avi"
+            normalized.write_bytes(b"normalized video protocol fixture")
+            analysis = {
+                "normalized_video": str(normalized), "ambiguity": [],
+                "confirmed_face_segments": [{"start_frame": 0, "end_frame": 25, "fps": 25}],
+            }
+            analysis_file = directory / "analysis.json"
+            runner.write_json(analysis_file, analysis)
+            config = {
+                "directory": str(directory), "analysis": str(analysis_file),
+                "video": str(root / "video.mp4"), "audio": str(root / "audio.wav"),
+                "output": str(directory / "synced.mp4"),
+                "proof": str(directory / "lipsync-proof.json"),
+            }
+            driver = "/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
+            environment = {
+                "DUBSTUDIO_TALKNET_ROOT": str(runtime / "TalkNet-ASD"),
+                "DUBSTUDIO_MUSETALK_PYTHON": str(muse / "bin/python"),
+                "DUBSTUDIO_DRIVER_LIBRARY_PATH": driver,
+                "DUBSTUDIO_SYSTEM_PATH": "/usr/bin:/bin",
+                "LD_LIBRARY_PATH": str(runtime / "app-env/lib/python3.10/site-packages/torch/lib") + ":" + driver,
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            }
+            captured = {}
+
+            def render(video, audio, job_dir, proof, log, require_lipsync, fast_profile):
+                captured.update(runner.os.environ)
+                rendered = job_dir / "rendered.mp4"
+                rendered.write_bytes(b"render protocol fixture, not visual validation")
+                return rendered, []
+
+            with patch.dict(runner.os.environ, environment, clear=True), \
+                 patch.object(legacy, "write_progress"), \
+                 patch.object(legacy, "run_streaming") as streaming, \
+                 patch.object(legacy, "musetalk", side_effect=render) as renderer:
+                runner.stage_main("lipsync", config)
+            renderer.assert_called_once()
+            streaming.assert_not_called()
+            self.assertNotIn("PYTORCH_CUDA_ALLOC_CONF", captured)
+            self.assertEqual(captured["DUBSTUDIO_DRIVER_LIBRARY_PATH"], driver)
+            self.assertEqual(captured["LD_LIBRARY_PATH"], ":".join([
+                str(muse / "lib/python3.10/site-packages/torch/lib"), str(cuda_library), driver,
+            ]))
+            self.assertNotIn(str(runtime / "app-env"), captured["LD_LIBRARY_PATH"])
+            self.assertEqual(captured["PATH"], str(muse / "bin") + ":/usr/bin:/bin")
+            self.assertEqual(Path(config["output"]).read_bytes(), b"render protocol fixture, not visual validation")
+            self.assertEqual(runner.read_json(Path(config["proof"])), analysis)
+
+
 class AnalysisAudioTests(unittest.TestCase):
     def test_analysis_replaces_original_audio_with_uploaded_audio(self):
         with tempfile.TemporaryDirectory() as temporary:

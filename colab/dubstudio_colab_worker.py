@@ -31,7 +31,8 @@ SCHEMA_VERSION = "1.0"
 # rosto falante. Em vídeo que muda de cena, só essa janela recebe MuseTalk;
 # os demais quadros originais são preservados, nunca recebem uma caixa facial
 # inventada e nunca são aceitos como vídeo congelado.
-LIPSYNC_CACHE_REVISION = "musetalk-talknet-multisegment-v14"
+LIPSYNC_CACHE_REVISION = "musetalk-talknet-multisegment-v15-source-timeline"
+TALKNET_TIMELINE_TOLERANCE_SECONDS = 0.15
 CHATTERBOX_LANGUAGES = {
     "ar", "da", "de", "el", "en", "es", "fi", "fr", "he", "hi", "it", "ja",
     "ko", "ms", "nl", "no", "pl", "pt", "ru", "sv", "sw", "tr", "zh",
@@ -225,6 +226,78 @@ def assert_video_stream_coverage(rendered: Path, source: Path, tolerance: float 
             "O renderizador de lip-sync gerou imagem por apenas "
             f"{actual:.3f}s de {expected:.3f}s. O áudio não será combinado com vídeo incompleto."
         )
+
+
+def bound_confirmed_talknet_segments(
+    raw_segments: list[dict],
+    source_duration: float,
+    normalized_duration: float,
+    minimum_frames: int = 20,
+) -> tuple[list[dict], dict]:
+    """Bind detected boxes to the real source timeline before rendering/proof.
+
+    TalkNet's 25-fps AVI can include a few repeated frames after the original
+    video ends (503 frames versus a 20-second source, for example). Only that
+    small normalization tail may be removed. We never stretch the timestamps,
+    fabricate coordinates, omit an ambiguous window, or repair a large drift.
+    Complete detected frames are kept; a fractional final frame is preserved
+    from the original instead of claiming facial evidence past its duration.
+    """
+    if (
+        not math.isfinite(source_duration) or not math.isfinite(normalized_duration)
+        or min(source_duration, normalized_duration) <= 0
+        or abs(normalized_duration - source_duration) > TALKNET_TIMELINE_TOLERANCE_SECONDS + 1e-6
+    ):
+        raise WorkerError("A duração normalizada do TalkNet não corresponde à faixa de vídeo original.")
+    if not isinstance(raw_segments, list) or not raw_segments or minimum_frames < 1:
+        raise WorkerError("TalkNet não forneceu trechos faciais confirmados para sincronizar.")
+    bounded = []
+    clipped = []
+    previous_end = 0.0
+    for index, raw in enumerate(raw_segments, start=1):
+        try:
+            start_frame, end_frame = int(raw["start_frame"]), int(raw["end_frame"])
+            fps = float(raw["fps"])
+            boxes = list(raw["boxes"])
+            integral_frames = float(raw["start_frame"]) == start_frame and float(raw["end_frame"]) == end_frame
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise WorkerError(f"O trecho facial {index} não possui coordenadas válidas.") from None
+        if (
+            not integral_frames or start_frame < 0 or not math.isfinite(fps)
+            or not 1 <= fps <= 120 or len(boxes) != end_frame - start_frame
+            or len(boxes) < minimum_frames
+        ):
+            raise WorkerError(f"O trecho facial {index} não cobre uma janela segura.")
+        start_seconds, raw_end_seconds = start_frame / fps, end_frame / fps
+        if start_seconds < previous_end - 1e-6:
+            raise WorkerError("Os trechos faciais confirmados estão sobrepostos ou fora de ordem.")
+        if raw_end_seconds > normalized_duration + 1e-6:
+            raise WorkerError(f"O trecho facial {index} excede a duração normalizada do TalkNet.")
+        if raw_end_seconds > source_duration + TALKNET_TIMELINE_TOLERANCE_SECONDS + 1e-6:
+            raise WorkerError(f"O trecho facial {index} excede a faixa de vídeo original além da normalização permitida.")
+        # floor, not round/ceil: every retained coordinate must fit completely
+        # inside v:0. Slice the tail rather than resampling/relabeling the boxes.
+        bounded_end = min(end_frame, math.floor(source_duration * fps + 1e-6))
+        retained_frames = bounded_end - start_frame
+        if retained_frames < minimum_frames:
+            raise WorkerError(f"O trecho facial {index} fica vazio ou curto demais na faixa de vídeo original.")
+        segment = dict(raw)
+        segment.update(start_frame=start_frame, end_frame=bounded_end, fps=fps, boxes=boxes[:retained_frames])
+        bounded.append(segment)
+        previous_end = bounded_end / fps
+        if bounded_end != end_frame:
+            clipped.append({
+                "segment": index, "original_end_frame": end_frame, "end_frame": bounded_end,
+                "removed_normalized_frames": end_frame - bounded_end,
+                "reason": "Quadros finais da normalização fora da faixa de vídeo original; não renderizados",
+            })
+    return bounded, {
+        "source_video_duration": source_duration,
+        "normalized_video_duration": normalized_duration,
+        "normalization_delta_seconds": normalized_duration - source_duration,
+        "maximum_normalization_delta_seconds": TALKNET_TIMELINE_TOLERANCE_SECONDS,
+        "clipped_segments": clipped,
+    }
 
 
 def _sequence(value: object) -> list:
@@ -1524,17 +1597,25 @@ def compose_face_patch(
     log: Path,
 ) -> Path:
     """Insere uma janela MuseTalk sem alterar as demais cenas do vídeo."""
-    source_duration = video_stream_duration(base_video)
+    # The reference remains the original video even after preceding patches.
+    # A normalized AVI or an accumulated composition cannot extend its timeline.
+    source_duration = video_stream_duration(reference_video)
+    base_duration = video_stream_duration(base_video)
     end_seconds = start_seconds + segment_duration
     reference_meta = ffprobe(reference_video)
     stream = next((item for item in reference_meta["streams"] if item.get("codec_type") == "video"), {})
     width, height = int(stream.get("width") or 0), int(stream.get("height") or 0)
-    if min(width, height) <= 0 or start_seconds < 0 or end_seconds > source_duration + 0.35:
+    if (
+        min(width, height) <= 0 or not math.isfinite(source_duration) or source_duration <= 0
+        or not math.isfinite(base_duration) or abs(base_duration - source_duration) > 0.05
+        or not math.isfinite(start_seconds) or not math.isfinite(segment_duration)
+        or start_seconds < 0 or segment_duration <= 0 or end_seconds > source_duration + 1e-6
+    ):
         raise WorkerError("A janela facial confirmada não cabe com segurança no vídeo original.")
     fps = source_frame_rate(reference_video)
     filters = []
     labels = []
-    if start_seconds > 0.02:
+    if start_seconds > 1e-6:
         filters.append(
             f"[1:v]trim=start=0:end={start_seconds:.6f},setpts=PTS-STARTPTS,"
             f"fps={fps:.6f},setsar=1[before]"
@@ -1545,7 +1626,7 @@ def compose_face_patch(
         f"fps={fps:.6f},scale={width}:{height}:flags=lanczos,setsar=1[face]"
     )
     labels.append("[face]")
-    if end_seconds < source_duration - 0.02:
+    if end_seconds < source_duration - 1e-6:
         filters.append(
             f"[1:v]trim=start={end_seconds:.6f}:end={source_duration:.6f},setpts=PTS-STARTPTS,"
             f"fps={fps:.6f},setsar=1[after]"
@@ -1579,6 +1660,8 @@ def render_confirmed_talknet_segments(
     raw_segments = analysis.get("confirmed_face_segments") or []
     if not isinstance(raw_segments, list) or not raw_segments:
         raise WorkerError("TalkNet não forneceu trechos faciais confirmados para sincronizar.")
+    if analysis.get("ambiguity") or analysis.get("ambiguous_intervals"):
+        raise WorkerError("A análise facial contém ambiguidades; nenhuma janela será omitida para renderizar.")
     talknet_root = Path(os.environ.get("DUBSTUDIO_TALKNET_ROOT", "/content/TalkNet-ASD"))
     normalized = talknet_root / "demo" / video.stem / "pyavi" / "video.avi"
     root = Path(os.environ.get("DUBSTUDIO_MUSETALK_ROOT", "/content/MuseTalk"))
@@ -1596,11 +1679,13 @@ def render_confirmed_talknet_segments(
     normalized_meta = ffprobe(normalized)
     normalized_stream = next((item for item in normalized_meta["streams"] if item.get("codec_type") == "video"), {})
     normalized_duration = video_stream_duration(normalized)
+    source_duration = video_stream_duration(video)
+    bounded_segments, timeline = bound_confirmed_talknet_segments(raw_segments, source_duration, normalized_duration)
     base_video = video
     confirmed_segments = []
-    total = len(raw_segments)
+    total = len(bounded_segments)
     os.environ["MPLBACKEND"] = "Agg"
-    for index, raw_segment in enumerate(raw_segments, start=1):
+    for index, raw_segment in enumerate(bounded_segments, start=1):
         try:
             start_frame = int(raw_segment.get("start_frame", -1))
             end_frame = int(raw_segment.get("end_frame", -1))
@@ -1612,7 +1697,7 @@ def render_confirmed_talknet_segments(
             raise WorkerError(f"O trecho facial {index} não cobre uma janela segura.")
         start_seconds = start_frame / fps
         segment_duration = len(boxes) / fps
-        if start_seconds + segment_duration > normalized_duration + 0.15:
+        if start_seconds + segment_duration > min(normalized_duration, source_duration) + 1e-6:
             raise WorkerError(f"O trecho facial {index} excede a duração normalizada do TalkNet.")
         segment_video = job_dir / f"musetalk-confirmed-face-{index:02d}.mp4"
         segment_audio = job_dir / f"musetalk-confirmed-face-{index:02d}.wav"
@@ -1656,17 +1741,20 @@ def render_confirmed_talknet_segments(
         rendered = select_musetalk_output(result_dir, before, result, f"MuseTalk não criou o trecho facial {index}.")
         assert_video_stream_coverage(rendered, segment_video)
         base_video = compose_face_patch(rendered, base_video, video, start_seconds, segment_duration, index, job_dir, log)
-        confirmed_segments.append({"start": round(start_seconds, 3), "end": round(start_seconds + segment_duration, 3)})
-    source_duration = video_stream_duration(video)
+        confirmed_segments.append({"start": start_seconds, "end": raw_segment["end_frame"] / fps})
     preserved = []
     cursor = 0.0
     for segment in confirmed_segments:
-        if segment["start"] - cursor > 0.05:
-            preserved.append({"start": round(cursor, 3), "end": segment["start"], "reason": "TalkNet não confirmou rosto falante; imagem original preservada"})
+        if segment["start"] - cursor > 1e-6:
+            preserved.append({"start": cursor, "end": segment["start"], "reason": "TalkNet não confirmou rosto falante; imagem original preservada"})
         cursor = segment["end"]
-    if source_duration - cursor > 0.05:
-        preserved.append({"start": round(cursor, 3), "end": round(source_duration, 3), "reason": "TalkNet não confirmou rosto falante; imagem original preservada"})
+    if source_duration - cursor > 1e-6:
+        preserved.append({"start": cursor, "end": source_duration, "reason": "TalkNet não confirmou rosto falante; imagem original preservada"})
     analysis["coordinate_source"] = "TalkNet completo em trechos faciais confirmados"
+    # runner_v2 derives its exported proof directly from these frame indices.
+    # They must describe exactly the same bounded boxes used by MuseTalk.
+    analysis["confirmed_face_segments"] = bounded_segments
+    analysis["source_timeline"] = timeline
     analysis["lipsync_confirmed_segments"] = confirmed_segments
     analysis["preserved_no_speaker_visual_segments"] = preserved
     analysis["musetalk_input"] = {"video": "trechos TalkNet", "audio": "trechos do mix", "coordinate_source": analysis["coordinate_source"]}

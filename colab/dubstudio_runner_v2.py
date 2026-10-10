@@ -273,6 +273,47 @@ def validate_uploaded_audio_duration(audio_duration: float, video_duration: floa
         raise PipelineError("O áudio enviado excede a duração da faixa de vídeo e seria cortado. Ajuste os arquivos antes de continuar; nenhuma fala será descartada automaticamente.")
 
 
+def validate_lipsync_timeline(report: dict, source_duration: float) -> None:
+    """Reject incomplete/out-of-source evidence before exporting a completed result."""
+    proof = report.get("lipsync", {})
+    if proof.get("required") is not True:
+        return
+    if proof.get("ambiguity") != []:
+        raise PipelineError("Lip-sync com ambiguidade: corrija a seleção do rosto antes de exportar.")
+    confirmed = proof.get("confirmed_segments")
+    preserved = report.get("preserved_no_speaker_visual_segments")
+    if not isinstance(confirmed, list) or not isinstance(preserved, list):
+        raise PipelineError("A evidência temporal do lip-sync está incompleta.")
+    faceless = (report.get("operation") == "dub_video" and
+                proof.get("no_visible_speaking_face") is True and
+                proof.get("scene_analysis_complete") is True and
+                proof.get("confirmed") is False and proof.get("applied") is False)
+    if (not confirmed and not faceless) or (confirmed and
+            (proof.get("confirmed") is not True or proof.get("applied") is not True)):
+        raise PipelineError("O lip-sync solicitado não possui trechos realmente confirmados.")
+    windows = []
+    for intervals in (confirmed, preserved):
+        previous_end = 0.0
+        for interval in intervals:
+            if not isinstance(interval, dict):
+                raise PipelineError("A evidência temporal do lip-sync está malformada.")
+            start, end = interval.get("start"), interval.get("end")
+            if any(isinstance(value, bool) or not isinstance(value, (int, float)) or
+                   not math.isfinite(value) for value in (start, end)):
+                raise PipelineError("O lip-sync possui tempo inválido no relatório.")
+            if start < 0 or end <= start or end > source_duration + 0.05 or start < previous_end - 0.001:
+                raise PipelineError("O lip-sync possui trecho fora da duração real do vídeo ou sobreposto.")
+            previous_end = end
+            windows.append((start, end))
+    cursor = 0.0
+    for start, end in sorted(windows):
+        if start < cursor - 0.001 or start > cursor + 0.05:
+            raise PipelineError("Os trechos sincronizados e preservados não cobrem o vídeo sem lacunas ou sobreposições.")
+        cursor = end
+    if abs(cursor - source_duration) > 0.05:
+        raise PipelineError("A evidência do lip-sync não cobre o vídeo até o fim.")
+
+
 class StageCache:
     def __init__(self, root: Path, storage: Path):
         self.root, self.storage = root, storage
@@ -744,8 +785,14 @@ def stage_main(name: str, config: dict) -> None:
         demo = talknet / "demo"
         demo.mkdir(exist_ok=True)
         root = demo / analysis_video.stem
+        # Migrate archives produced by older runners without deleting evidence.
+        for archive in demo.glob(f"{analysis_video.stem}.previous-*"):
+            if archive.is_dir():
+                archive.rename(archive.with_name(f".previous-{archive.name}-{time.time_ns()}"))
         if root.exists():
-            root.rename(root.with_name(root.name + f".previous-{time.time_ns()}"))
+            # TalkNet takes the first match for videoName + '.*'. An archive
+            # with that prefix would be selected as input instead of the MP4.
+            root.rename(root.with_name(f".previous-{root.name}-{time.time_ns()}"))
         shutil.copy2(analysis_video, demo / f"{analysis_video.stem}.mp4")
         # This narrow NumPy repair belongs to the disposable runtime checkout,
         # not the user's immutable source package.
@@ -801,6 +848,9 @@ def stage_main(name: str, config: dict) -> None:
         # Prevent app CUDA libraries from taking precedence over MuseTalk's isolated Torch.
         muse_env = Path(os.environ["DUBSTUDIO_MUSETALK_PYTHON"]).parent.parent
         from dubstudio_bootstrap import musetalk_environment
+        # update() only replaces existing values; it never deletes keys omitted
+        # by the isolated environment. Torch 2.0 rejects expandable_segments.
+        os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
         os.environ.update(musetalk_environment(muse_env.parent, os.environ))
         # A previous interrupted render must not be mistaken for a newly produced
         # result, nor excluded by the legacy renderer when overwritten in place.
@@ -1023,6 +1073,7 @@ def process(package: Path, work_root: Path, storage: Path, output: Path) -> dict
                     if operation == "lipsync_video":
                         report["lipsync"]["coordinate_source"] = "S3FD/trilhas faciais para áudio enviado; fala original não confirmada"
                     report["preserved_no_speaker_visual_segments"] = proof.get("preserved_no_speaker_visual_segments", [])
+                validate_lipsync_timeline(report, duration)
                 cache.stage(f"export-{language}", f"Exportação {language}", {"directory": str(target), "stage": "export", "identity": identity, "video": str(synced), "video_hash": sha256(synced), "audio": str(target / "mix.wav"), "audio_hash": sha256(target / "mix.wav"), "source": str(video), "duration": duration, "subtitle_mode": options.get("subtitle_mode", "none"), "srt": str(target / "translation.srt"), "output": str(target / "video.mp4"), "validation": str(target / "media-validation.json")}, [target / "video.mp4", target / "media-validation.json"])
                 report["summary"] = read_json(target / "media-validation.json")
                 files["video"] = target / "video.mp4"
