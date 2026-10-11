@@ -1846,6 +1846,31 @@ def spatial_face_boxes(
 
 PERIORAL_MASK_CONTRACT = "perioral-source-dwpose68-inner-feather-v1"
 PERIORAL_MUSE_COMMIT = "0a89dec45a0192b824e3cf4daf96c239440c5ed8"
+PERIORAL_SCORE_POLICY = "dwpose-mmpose110-simcc-response-cap-one-v1"
+
+
+def adapt_perioral_simcc_points(points: object) -> tuple[list[list[float]], list[float]]:
+    """Adapt pinned SimCC responses, not calibrated probabilities.
+
+    MMPose 1.1.0 SimCCLabel.decode returns min(max(x), max(y)) without softmax.
+    MuseTalk's pinned DWPose codec uses normalize=False. Scores above one are
+    valid raw responses; cap only that upper tail, keep weak scores/coordinates
+    unchanged, and retain raw values for a reproducible audit. This does not
+    alter the .55, original-track or anatomical mask gates.
+    """
+    if not isinstance(points, (list, tuple)) or len(points) != 68:
+        raise WorkerError("O adaptador SimCC exige 68 pontos brutos reais.")
+    mapped, responses = [], []
+    for point in points:
+        if (not isinstance(point, (list, tuple)) or len(point) != 3
+                or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                       or not math.isfinite(value) for value in point)
+                or point[2] < 0):
+            raise WorkerError("Resposta SimCC bruta inválida; landmarks recusados.")
+        x, y, score = map(float, point)
+        mapped.append([x, y, min(1.0, score)])
+        responses.append(score)
+    return mapped, responses
 
 
 def perioral_landmark_polygon(width: int, height: int, bbox: tuple[int, int, int, int],
@@ -2018,13 +2043,30 @@ def generate_perioral_landmarks(reference_video: Path, boxes: list, width: int, 
     if not checkpoint.is_file() or not config.is_file():
         raise WorkerError("Modelo/configuração DWPose local ausente; landmarks não serão inventados.")
     model_sha = sha256(checkpoint)
-    identity = hashlib.sha256(json.dumps({**binding, "model_sha256": model_sha}, sort_keys=True).encode()).hexdigest()
+    identity = hashlib.sha256(json.dumps({**binding, "model_sha256": model_sha,
+                                          "score_policy": PERIORAL_SCORE_POLICY}, sort_keys=True).encode()).hexdigest()
     target = job_dir / f"perioral-landmarks-{identity}.json"
     if target.is_file():
         try:
             payload = json.loads(target.read_text(encoding="utf-8"))
         except (OSError, ValueError) as error:
             raise WorkerError("O cache de landmarks periorais está ilegível; composição bloqueada.") from error
+        if payload.get("score_policy") != PERIORAL_SCORE_POLICY:
+            raise WorkerError("O cache perioral não comprova a adaptação do score SimCC atual.")
+        frames = payload.get("frames")
+        if not isinstance(frames, list):
+            raise WorkerError("O cache perioral não preservou os scores SimCC brutos.")
+        for frame in frames:
+            if not isinstance(frame, dict):
+                raise WorkerError("O cache perioral não preservou os scores SimCC brutos.")
+            points, scores = frame.get("points"), frame.get("raw_scores")
+            if (not isinstance(points, list) or len(points) != 68
+                    or not isinstance(scores, list) or len(scores) != 68
+                    or any(not isinstance(point, list) or len(point) != 3 for point in points)):
+                raise WorkerError("O cache perioral não preservou os scores SimCC brutos.")
+            adapted, raw = adapt_perioral_simcc_points([[*point[:2], score] for point, score in zip(points, scores)])
+            if adapted != points or raw != scores:
+                raise WorkerError("O cache perioral alterou a adaptação ou os scores SimCC brutos.")
         validate_perioral_landmarks(payload, binding, boxes)
         if payload["model_sha256"] != model_sha:
             raise WorkerError("Os pesos dos landmarks diferem do cache perioral.")
@@ -2032,7 +2074,7 @@ def generate_perioral_landmarks(reference_video: Path, boxes: list, width: int, 
     request = job_dir / f".perioral-request-{time.time_ns()}.json"
     staged = job_dir / f".perioral-landmarks-{time.time_ns()}.json"
     write_json(request, {**binding, "boxes": boxes, "source": str(reference_video.resolve()),
-                         "model_sha256": model_sha, "device": device})
+                         "model_sha256": model_sha, "device": device, "score_policy": PERIORAL_SCORE_POLICY})
     script = r'''
 import os, sys, json, hashlib, subprocess
 from pathlib import Path
@@ -2100,10 +2142,23 @@ Path(sys.argv[2]).write_text(json.dumps(payload,allow_nan=False), encoding="utf-
             payload = json.loads(staged.read_text(encoding="utf-8"))
         except (OSError, ValueError) as error:
             raise WorkerError("A inferência não produziu landmarks periorais legíveis; composição bloqueada.") from error
+        raw_diagnostic = job_dir / f"perioral-raw-simcc-{identity}-{time.time_ns()}.json"
+        write_json(raw_diagnostic, {"purpose": "Resposta bruta de diagnóstico; não é prova aprovada",
+                                   "approved": False, "payload": payload})
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write(f"\nScores SimCC brutos preservados: {raw_diagnostic}\n")
+        if (payload.get("score_policy") != PERIORAL_SCORE_POLICY
+                or not isinstance(payload.get("frames"), list)):
+            raise WorkerError("A inferência não comprova o contrato de score SimCC fixado.")
+        for frame in payload["frames"]:
+            if not isinstance(frame, dict):
+                raise WorkerError("A inferência SimCC não produziu um quadro válido.")
+            frame["points"], frame["raw_scores"] = adapt_perioral_simcc_points(frame.get("points"))
         validate_perioral_landmarks(payload, binding, boxes)
         if (payload["model_sha256"] != model_sha or sha256(reference_video) != binding["source_sha256"]
                 or sha256(checkpoint) != model_sha):
             raise WorkerError("Fonte ou pesos mudaram durante os landmarks periorais; cache recusado.")
+        write_json(staged, payload)
         staged.replace(target)
         return payload
     except subprocess.TimeoutExpired as error:

@@ -3,8 +3,10 @@
 import copy
 import hashlib
 import json
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 import wave
@@ -18,6 +20,135 @@ import dubstudio_colab_worker as worker
 
 def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+class SimccRawResponseAdapterTests(unittest.TestCase):
+    def points(self):
+        from test_perioral_composition import face68
+        return face68()  # Explicitly synthetic geometry; not model-quality proof.
+
+    def test_real_over_one_response_is_retained_without_moving_geometry(self):
+        points = self.points()
+        points[10][2] = 1.040973424911499  # Actual failing response, synthetic pose.
+        before = copy.deepcopy(points)
+        adapted, raw = worker.adapt_perioral_simcc_points(points)
+        self.assertEqual(adapted[10][2], 1.0)
+        self.assertEqual(raw[10], 1.040973424911499)
+        self.assertEqual(points, before)
+        self.assertEqual([point[:2] for point in adapted], [point[:2] for point in before])
+        worker.perioral_landmark_polygon(240,240,(20,20,220,220),adapted)
+
+    def test_weak_response_is_not_rescaled_or_promoted(self):
+        points = self.points()
+        points[10][2], points[48][2] = 1.8, .549
+        adapted, _ = worker.adapt_perioral_simcc_points(points)
+        self.assertEqual(adapted[48][2], .549)
+        with self.assertRaisesRegex(worker.WorkerError, "Landmark facial 48"):
+            worker.perioral_landmark_polygon(240,240,(20,20,220,220),adapted)
+
+    def test_required_chin_and_mouth_outside_original_track_still_block(self):
+        for index in (8,48,54):
+            points = self.points()
+            points[index] = [230,190,1.14]
+            adapted, _ = worker.adapt_perioral_simcc_points(points)
+            with self.subTest(index=index), self.assertRaisesRegex(worker.WorkerError, f"Landmark facial {index}"):
+                worker.perioral_landmark_polygon(240,240,(20,20,220,220),adapted)
+
+    def test_unused_jaw_outside_never_inflates_track_or_mask(self):
+        points, box = self.points(), (20,20,220,220)
+        expected = worker.perioral_mask_frame(240,240,box,points)
+        points[10] = [230,190,1.04]
+        adapted, _ = worker.adapt_perioral_simcc_points(points)
+        self.assertEqual(worker.perioral_mask_frame(240,240,box,adapted), expected)
+        self.assertEqual(box, (20,20,220,220))
+
+    def test_capping_strong_responses_leaves_eye_forehead_mask_bytes_identical(self):
+        points, box = self.points(), (20,20,220,220)
+        expected = worker.perioral_mask_frame(240,240,box,points)
+        for point in points:
+            point[2] = 1.14
+        adapted, _ = worker.adapt_perioral_simcc_points(points)
+        self.assertEqual(worker.perioral_mask_frame(240,240,box,adapted), expected)
+
+    def test_invalid_scores_or_shape_never_enter_geometry(self):
+        for score in (-.1,float("nan"),float("inf"),True,"1.1"):
+            points = self.points()
+            points[10][2] = score
+            with self.subTest(score=score), self.assertRaises(worker.WorkerError):
+                worker.adapt_perioral_simcc_points(points)
+        for points in (None,[],self.points()[:67],[[]]*68):
+            with self.subTest(points=points), self.assertRaises(worker.WorkerError):
+                worker.adapt_perioral_simcc_points(points)
+
+    def prepared_generator(self, low=False):
+        temporary = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent, prefix=".test-simcc-")
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        source = root / "source.mp4"
+        source.write_bytes(b"synthetic source identity; model calls mocked")
+        config = root / "musetalk/utils/dwpose/rtmpose-l_8xb32-270e_coco-ubody-wholebody-384x288.py"
+        config.parent.mkdir(parents=True)
+        config.write_bytes(b"synthetic pinned config")
+        weights = root / "models/dwpose/dw-ll_ucoco_384.pth"
+        weights.parent.mkdir(parents=True)
+        weights.write_bytes(b"synthetic local model identity")
+        environment = {"DUBSTUDIO_MUSETALK_ROOT":str(root), "DUBSTUDIO_MUSETALK_PYTHON":sys.executable}
+        calls = []
+        def inference(command, **options):
+            if command[0] == "git":
+                return subprocess.CompletedProcess(command,0,worker.PERIORAL_MUSE_COMMIT," ")
+            calls.append(command)
+            request = json.loads(Path(command[-2]).read_text())
+            points = self.points()
+            points[10][2] = 1.040973424911499
+            if low:
+                points[48][2] = .549
+            payload = {key:value for key,value in request.items() if key not in {"source","boxes"}}
+            payload["frames"] = [{"frame_index":0, "points":points}]
+            write_json(Path(command[-1]),payload)
+            return subprocess.CompletedProcess(command,0,"synthetic inference only","")
+        return root, source, environment, calls, inference
+
+    def test_generated_cache_preserves_raw_response_and_policy_then_reuses_it(self):
+        root, source, environment, calls, inference = self.prepared_generator()
+        with patch.dict(os.environ,environment), patch.object(worker.subprocess,"run",side_effect=inference):
+            first = worker.generate_perioral_landmarks(source,[(20,20,220,220)],240,240,0,root,root/"log",device="cpu")
+            second = worker.generate_perioral_landmarks(source,[(20,20,220,220)],240,240,0,root,root/"log",device="cpu")
+        self.assertEqual(len(calls),1)
+        self.assertEqual(first,second)
+        self.assertEqual(first["score_policy"],worker.PERIORAL_SCORE_POLICY)
+        self.assertEqual(first["frames"][0]["points"][10][2],1.0)
+        self.assertEqual(first["frames"][0]["raw_scores"][10],1.040973424911499)
+        diagnostic = json.loads(next(root.glob("perioral-raw-simcc-*.json")).read_text())
+        self.assertIs(diagnostic["approved"],False)
+        self.assertEqual(diagnostic["payload"]["frames"][0]["points"][10][2],1.040973424911499)
+
+    def test_cache_without_raw_score_policy_or_with_tamper_fails_before_new_model_call(self):
+        for mutation in ("missing_policy","missing_raw","weak_raw_tamper","bad_frame"):
+            root, source, environment, calls, inference = self.prepared_generator()
+            with self.subTest(mutation=mutation), patch.dict(os.environ,environment), patch.object(worker.subprocess,"run",side_effect=inference):
+                worker.generate_perioral_landmarks(source,[(20,20,220,220)],240,240,0,root,root/"log",device="cpu")
+                cached = next(root.glob("perioral-landmarks-*.json"))
+                payload = json.loads(cached.read_text())
+                if mutation == "missing_policy": payload.pop("score_policy")
+                elif mutation == "missing_raw": payload["frames"][0].pop("raw_scores")
+                elif mutation == "weak_raw_tamper": payload["frames"][0]["raw_scores"][48] = .2
+                else: payload["frames"][0] = None
+                write_json(cached,payload)
+                with self.assertRaisesRegex(worker.WorkerError,"cache perioral"):
+                    worker.generate_perioral_landmarks(source,[(20,20,220,220)],240,240,0,root,root/"log",device="cpu")
+            self.assertEqual(len(calls),1)
+
+    def test_geometry_failure_preserves_raw_diagnostic_without_promoting_cache(self):
+        root, source, environment, calls, inference = self.prepared_generator(low=True)
+        with patch.dict(os.environ,environment), patch.object(worker.subprocess,"run",side_effect=inference):
+            with self.assertRaisesRegex(worker.WorkerError,"Landmark facial 48"):
+                worker.generate_perioral_landmarks(source,[(20,20,220,220)],240,240,0,root,root/"log",device="cpu")
+        self.assertEqual(len(calls),1)
+        self.assertFalse(list(root.glob("perioral-landmarks-*.json")))
+        diagnostic = json.loads(next(root.glob("perioral-raw-simcc-*.json")).read_text())
+        self.assertIs(diagnostic["approved"],False)
+        self.assertEqual(diagnostic["payload"]["frames"][0]["points"][48][2],.549)
 
 
 class AudioMasterWorkerTests(unittest.TestCase):
