@@ -1,0 +1,15 @@
+'use strict';
+const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm'),path=require('node:path');
+const context=vm.createContext({console});
+vm.runInContext(fs.readFileSync(path.join(__dirname,'../static/app.js'),'utf8').replace(/init\(\);\s*$/,''),context);
+const job={status:'failed',options:{operation:'dub_video',require_lipsync:true},metadata:{studio_outputs:[]}};
+assert.equal(context.canRepairFace(job),true);
+assert.equal(context.statusName('awaiting_preparation'),'Seleção salva');
+for(const status of ['complete','preparing','processing_colab','deleted'])assert.equal(context.canRepairFace({...job,status}),false);
+assert.equal(context.canRepairFace({...job,options:{...job.options,require_lipsync:false}}),false);
+assert.equal(context.canRepairFace({...job,options:{...job.options,operation:'text_to_voice'}}),false);
+const approved={...job,outputs:[{language:'pl-PL',status:'complete'}],metadata:{studio_outputs:[{language:'pl-PL',status:'complete'}],outputs:[{language:'pl-PL',status:'complete'}]}};
+assert.equal(context.canRepairFace(approved),false);
+assert.ok(context.faceRepairSelection([47.8,.2,.1,.5,.4],79.782,480,854));
+for(const input of [[80,.2,.1,.5,.4],[-1,.2,.1,.5,.4],[47.8,-.2,.1,.5,.4],[47.8,.9,.1,.5,.4],[47.8,.2,.1,.01,.4],[47.8,.2,.1,.5,0],[NaN,.2,.1,.5,.4]])assert.equal(context.faceRepairSelection(input,79.782,480,854),null);
+console.log('Face repair: failed-only eligibility, approved-result protection, finite bounds and real-pixel minimum: PASS');

@@ -62,6 +62,7 @@ class AnalysisResumeSafetyTests(unittest.TestCase):
                  patch.object(runner, "run_command") as command, \
                  patch.object(runner.shutil, "rmtree") as deletion, \
                  patch.object(legacy, "write_progress"), \
+                 patch.object(legacy, "patch_talknet_video_normalization", return_value=legacy.TALKNET_NORMALIZATION_REVISION), \
                  patch.object(legacy, "run_streaming", side_effect=analyse) as streaming, \
                  patch.object(legacy, "video_frame_count", return_value=25):
                 if fail_analysis:

@@ -3,8 +3,10 @@
 const state = {
   view: 'dub', operation: 'dub_video', catalog: { languages: [], presets: [] },
   languages: new Set(['pl-PL']), jobs: [], selectedJob: null, settings: {},
-  health: null, loadingJobs: false, launchPending: null, previewUrl: null, review: null,
-  faceSelection: null, faceDrag: null, dubLipsync: true
+  health: null, loadingJobs: false, jobsLoadPromise: null, jobsRefreshRequested: false, jobsRefreshQuiet: true,
+  launchPending: null, previewUrl: null, review: null, reviewRequest: 0,
+  faceSelection: null, faceDrag: null, dubLipsync: true, previewLanguages: new Map(),
+  trashJobs: [], librarySection: 'projects'
 };
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -41,10 +43,43 @@ function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
 }
 async function api(path, options = {}) {
-  const response = await fetch(path, { cache: 'no-store', ...options });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.error || payload.message || `A solicitação falhou (${response.status}).`);
-  return payload;
+  const { timeoutMs: requestedTimeout, signal: callerSignal, ...requestOptions } = options;
+  const readOnly = ['GET', 'HEAD'].includes(String(options.method || 'GET').toUpperCase());
+  let timeoutMs = readOnly ? 45000 : 120000;
+  if (!readOnly && options.body instanceof FormData) {
+    let bytes = 0;
+    for (const value of options.body.values()) {
+      if (value && typeof value.size === 'number' && Number.isFinite(value.size) && value.size > 0) bytes += value.size;
+    }
+    // Allow local ZIP upload plus extraction/validation, conservatively at
+    // 1 MiB/s, while still bounding a stalled import to thirty minutes.
+    timeoutMs = Math.min(1800000, 120000 + Math.ceil(bytes / (1024 * 1024)) * 1000);
+  }
+  if (requestedTimeout !== undefined) {
+    if (typeof requestedTimeout !== 'number' || !Number.isFinite(requestedTimeout) || requestedTimeout < 1000 || requestedTimeout > 1800000) throw new Error('Prazo da solicitação inválido.');
+    timeoutMs = requestedTimeout;
+  }
+  const controller = new AbortController();
+  const forwardAbort = () => controller.abort(callerSignal.reason);
+  if (callerSignal?.aborted) forwardAbort();
+  else callerSignal?.addEventListener('abort', forwardAbort, { once: true });
+  let expired = false, timer;
+  const timeoutError = new Error(readOnly
+    ? `O Studio não respondeu em ${Math.round(timeoutMs / 1000)} segundos. Atualize a lista e tente novamente.`
+    : 'O Studio não concluiu a resposta dentro do prazo. A operação pode ter sido salva; confira o projeto antes de repetir o envio. Nenhum reenvio automático foi feito.');
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => { expired = true; controller.abort(); reject(timeoutError); }, timeoutMs);
+  });
+  try {
+    const operation = (async () => {
+      const response = await fetch(path, { cache: 'no-store', ...requestOptions, signal: controller.signal });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || payload.message || `A solicitação falhou (${response.status}).`);
+      return payload;
+    })();
+    return await Promise.race([operation, deadline]);
+  } catch (error) { throw expired ? timeoutError : error; }
+  finally { clearTimeout(timer); callerSignal?.removeEventListener('abort', forwardAbort); }
 }
 function toast(message) {
   $('#toast').textContent = message;
@@ -75,7 +110,7 @@ function outputPath(job, language, kind, preview = false) {
 }
 const labels = {
   dub: { operation: 'dub_video', crumb: 'Dublar vídeo', kicker: 'UM VÍDEO. MUITAS POSSIBILIDADES.', title: 'Sua voz, em novos idiomas', description: 'Duble seu vídeo com o timbre original e sincronização labial.', media: 'Seu vídeo original', controls: 'Personalize a dublagem' },
-  lipsync: { operation: 'lipsync_video', crumb: 'Lip-sync com áudio', kicker: 'VOZ E IMAGEM. EM SINTONIA.', title: 'Dê o ritmo certo à sua criação', description: 'Combine seu vídeo com um áudio e sincronize o rosto falante.', media: 'Seu vídeo', controls: 'Personalize o lip-sync' },
+  lipsync: { operation: 'lipsync_video', crumb: 'Lip-sync com áudio', kicker: 'VOZ E IMAGEM. EM SINTONIA.', title: 'Dê o ritmo certo à sua criação', description: 'Aplique o áudio enviado a um rosto detectado ou escolhido por você.', media: 'Seu vídeo', controls: 'Personalize o lip-sync' },
   tts: { operation: 'text_to_voice', crumb: 'Texto para voz', kicker: 'PALAVRAS COM A SUA IDENTIDADE.', title: 'Transforme seu texto em voz', description: 'Crie uma narração com uma referência vocal autorizada.', media: 'Seu texto', controls: 'Personalize a voz' }
 };
 function showView(view, { updateHash = true } = {}) {
@@ -136,7 +171,7 @@ function usesLipsync() {
 function updateLipsyncOptions() {
   const enabled = usesLipsync();
   $('#lipsyncLabel').textContent = state.operation === 'lipsync_video' ? 'Sincronização labial' : 'Sincronização labial (opcional)';
-  $('#lipsyncDescription').textContent = state.operation === 'lipsync_video' ? 'Ajustar o rosto ao áudio enviado' : enabled ? 'Ajustar boca à voz dublada' : 'Dublar áudio sem alterar movimentos da boca';
+  $('#lipsyncDescription').textContent = state.operation === 'lipsync_video' ? 'O áudio é usado como um único mix. Não identifica nem associa automaticamente várias vozes a vários rostos.' : enabled ? 'Ajustar boca à voz dublada' : 'Dublar áudio sem alterar movimentos da boca';
   $('#lipBenefit').textContent = enabled ? 'Voz e imagem no mesmo ritmo' : 'Movimentos originais preservados';
   $('#faceField').hidden = !enabled;
   $('#faceOverlay').hidden = !enabled || $('#faceSelection').value !== 'manual';
@@ -326,18 +361,23 @@ async function startProject(event) {
   try {
     const payload = await api('/api/jobs', { method: 'POST', body: form });
     const job = payload.job || payload;
+    state.librarySection = 'projects';
     state.selectedJob = job.id;
-    state.launchPending = { id: job.id, tab, url, blocked: Boolean(url && !tab) };
+    // Show the acknowledged project immediately, even if a pre-creation GET is
+    // still in flight or the following list has not included it yet.
+    state.jobs = [job, ...state.jobs.filter(item => item.id !== job.id)];
+    state.launchPending = { id: job.id, job, tab, url, blocked: Boolean(url && !tab) };
     tab = null;
+    renderJobs();
     showView('creations');
-    await loadJobs({ quiet: true });
+    await loadJobs({ quiet: true, invalidate: true });
     toast('Projeto criado. Preparando o pacote para o Colab.');
   } catch (error) { if (tab) tab.close(); toast(error.message); }
   finally { button.disabled = false; $('#createButtonLabel').textContent = 'Preparar e abrir no Colab'; }
 }
 function statusName(status) {
   if (status === 'legacy') return 'Histórico preservado';
-  return ({ queued: 'Preparando', preparing: 'Preparando pacote', preparing_colab: 'Preparando pacote', running: 'Preparando pacote', awaiting_colab: 'Pacote pronto', awaiting_import: 'Aguardando resultado', processing_colab: 'No Colab', external_running: 'No Colab', review_required: 'Revisar tradução', awaiting_review: 'Revisar tradução', review_approved: 'Revisão aprovada', validating: 'Conferindo resultado', complete: 'Resultado aprovado', partial: 'Resultados parciais', failed: 'Precisa de atenção', archived: 'Arquivado', cancelled: 'Interrompido' })[status] || 'Acompanhe pelo notebook';
+  return ({ queued: 'Preparando', preparing: 'Preparando pacote', preparing_colab: 'Preparando pacote', awaiting_preparation: 'Seleção salva', running: 'Preparando pacote', awaiting_colab: 'Pacote pronto', awaiting_import: 'Aguardando resultado', processing_colab: 'No Colab', external_running: 'No Colab', review_required: 'Revisar tradução', awaiting_review: 'Revisar tradução', review_approved: 'Revisão aprovada', validating: 'Conferindo resultado', complete: 'Resultado pronto', partial: 'Resultados parciais', failed: 'Precisa de atenção', archived: 'Arquivado', cancelled: 'Interrompido' })[status] || 'Acompanhe pelo notebook';
 }
 function isExternal(job) { return ['awaiting_import', 'external_running', 'processing_colab'].includes(job.status); }
 function jobTitle(job) { return job.options?.original_name || job.options?.title || job.metadata?.original_name || (job.options?.operation === 'text_to_voice' ? 'Narração de texto' : `Projeto ${job.id}`); }
@@ -346,51 +386,172 @@ function outputsFor(job) {
   const value = job.metadata?.outputs || job.metadata?.studio_results || job.outputs || [];
   return Array.isArray(value) ? value : Object.entries(value).map(([language, output]) => ({ language, ...output }));
 }
-async function loadJobs({ quiet = false } = {}) {
-  if (state.loadingJobs) return;
+function outputFileKinds(output) {
+  const files = output.files || {};
+  return Array.isArray(files) ? files.map(file => typeof file === 'string' ? file : file.kind) : Object.keys(files);
+}
+function previewOutputs(job) {
+  const isTts = job.options?.operation === 'text_to_voice';
+  return outputsFor(job).filter(output => ['complete', 'approved', 'validated'].includes(output.status)).map(output => {
+    const kinds = outputFileKinds(output);
+    const kind = !isTts && kinds.includes('video') ? 'video' : kinds.includes('wav') ? 'wav' : kinds.includes('mp3') ? 'mp3' : null;
+    return { language: output.language || output.code || 'original', kind };
+  }).filter(output => output.kind);
+}
+function selectedPreview(job, versions = previewOutputs(job)) {
+  const selected = versions.find(output => output.language === state.previewLanguages.get(job.id)) || versions[0];
+  if (selected) state.previewLanguages.set(job.id, selected.language);
+  return selected;
+}
+function renderJobPreview(job) {
+  const versions = previewOutputs(job);
+  const selected = selectedPreview(job, versions);
+  if (!selected) return job.options?.operation === 'text_to_voice' ? '' : `<video controls playsinline preload="metadata" class="job-preview" src="${jobPath(job.id, '/source')}"></video>`;
+  const selector = `<label class="field"><span>Idioma da prévia</span><select data-preview-language aria-label="Idioma da prévia">${versions.map(output => `<option value="${escapeHtml(output.language)}" ${output.language === selected.language ? 'selected' : ''}>${escapeHtml(languageName(output.language))}</option>`).join('')}</select></label>`;
+  const source = outputPath(job, selected.language, selected.kind, true);
+  const name = escapeHtml(`Prévia: ${languageName(selected.language)}`);
+  const media = selected.kind === 'video' ? `<video controls playsinline preload="metadata" class="job-preview" data-result-preview aria-label="${name}" src="${source}"></video>` : `<audio controls preload="metadata" class="job-preview audio" data-result-preview aria-label="${name}" src="${source}"></audio>`;
+  return selector + media;
+}
+function selectJobPreview(job, language) {
+  const versions = previewOutputs(job);
+  const chosen = versions.find(output => output.language === language);
+  const detail = $('[data-current-job]', $('#jobDetail'));
+  if (!chosen || !detail || detail.dataset.currentJob !== job.id) return false;
+  let player = $('[data-result-preview]', detail);
+  if (!player) return false;
+  const selector = $('[data-preview-language]', detail);
+  const source = outputPath(job, chosen.language, chosen.kind, true);
+  state.previewLanguages.set(job.id, chosen.language);
+  if (selector) selector.value = chosen.language;
+  if (player.getAttribute('src') === source) return true;
+  player.pause();
+  const tag = chosen.kind === 'video' ? 'video' : 'audio';
+  if (player.tagName.toLowerCase() !== tag) {
+    const replacement = document.createElement(tag);
+    replacement.setAttribute('controls', '');
+    replacement.setAttribute('preload', 'metadata');
+    replacement.setAttribute('data-result-preview', '');
+    if (tag === 'video') replacement.setAttribute('playsinline', '');
+    replacement.className = tag === 'video' ? 'job-preview' : 'job-preview audio';
+    replacement.volume = player.volume;
+    replacement.muted = player.muted;
+    player.replaceWith(replacement);
+    player = replacement;
+  }
+  player.setAttribute('aria-label', `Prévia: ${languageName(chosen.language)}`);
+  player.setAttribute('src', source);
+  player.load(); // Stream only this approved version; do not download or reload the page.
+  return true;
+}
+function loadJobs({ quiet = false, invalidate = !quiet } = {}) {
+  if (state.loadingJobs) {
+    // Passive four-second ticks share this request. Only acknowledged user
+    // changes invalidate a pre-change GET and need one coalesced follow-up.
+    // Enqueuing every quiet tick can otherwise starve render and its callers.
+    if (invalidate) state.jobsRefreshRequested = true;
+    state.jobsRefreshQuiet = state.jobsRefreshQuiet && quiet;
+    return state.jobsLoadPromise;
+  }
   state.loadingJobs = true;
+  state.jobsRefreshQuiet = quiet;
+  state.jobsLoadPromise = (async () => {
+    do {
+      state.jobsRefreshRequested = false;
+      try {
+        const [payload, trash] = await Promise.all([api('/api/jobs'), api('/api/trash')]);
+        // A mutating refresh during this GET belongs to newer user state.
+        // Drain one coalesced follow-up before committing the old snapshot.
+        if (state.jobsRefreshRequested) continue;
+        state.jobs = (Array.isArray(payload) ? payload : payload.jobs || []).filter(job => job.status !== 'archived');
+        const provisional = state.launchPending?.job;
+        if (provisional) {
+          if (state.jobs.some(job => job.id === provisional.id)) state.launchPending.job = null;
+          else state.jobs.unshift(provisional);
+        }
+        state.trashJobs = trash.jobs || [];
+        $('#jobCount').textContent = state.jobs.length;
+        $('#lastRefresh').textContent = 'Atualizado agora';
+        renderJobs();
+        await finishLaunchIfReady();
+      } catch (error) { if (!state.jobsRefreshRequested && !state.jobsRefreshQuiet) toast(error.message); }
+    } while (state.jobsRefreshRequested);
+  })().finally(() => {
+    state.loadingJobs = false;
+    state.jobsLoadPromise = null;
+  });
+  return state.jobsLoadPromise;
+}
+function restoreLibrarySelection() {
+  if (state.selectedJob || state.librarySection !== 'projects') return;
   try {
-    const payload = await api('/api/jobs');
-    state.jobs = (Array.isArray(payload) ? payload : payload.jobs || []).filter(job => job.status !== 'archived');
-    $('#jobCount').textContent = state.jobs.length;
-    $('#lastRefresh').textContent = 'Atualizado agora';
+    const selection = JSON.parse(sessionStorage.getItem('dubstudio.librarySelection') || 'null');
+    if (!selection || !['projects', 'trash'].includes(selection.section)
+        || (selection.jobId !== null && (typeof selection.jobId !== 'string' || !selection.jobId || selection.jobId.length > 128))) return;
+    state.librarySection = selection.section;
+    state.selectedJob = selection.jobId;
+  } catch (_) { /* Storage can be unavailable in private or restricted tabs. */ }
+}
+function rememberLibrarySelection() {
+  try {
+    sessionStorage.setItem('dubstudio.librarySelection', JSON.stringify({ section: state.librarySection, jobId: state.selectedJob }));
+  } catch (_) { /* Selection still works without browser persistence. */ }
+}
+function visibleJobs() {
+  return state.librarySection === 'trash' ? state.trashJobs : state.jobs;
+}
+function installLibraryFilter() {
+  const header = $('.library-header');
+  if (!header || $('[data-library-section]')) return;
+  header.insertAdjacentHTML('afterend', '<div class="library-tabs" role="group" aria-label="Exibir projetos"><button type="button" data-library-section="projects" aria-pressed="true">Projetos</button><button type="button" data-library-section="trash" aria-pressed="false"><span data-icon="trash"></span>Lixeira</button></div>');
+  paintIcons(header.parentElement);
+  $$('[data-library-section]').forEach(button => button.addEventListener('click', () => {
+    state.librarySection = button.dataset.librarySection;
+    state.selectedJob = null;
     renderJobs();
-    await finishLaunchIfReady();
-  } catch (error) { if (!quiet) toast(error.message); }
-  finally { state.loadingJobs = false; }
+    loadJobs({ quiet: true });
+  }));
 }
 function renderJobs() {
-  if (!state.selectedJob || !state.jobs.some(job => job.id === state.selectedJob)) state.selectedJob = state.jobs[0]?.id || null;
+  const jobs = visibleJobs();
+  $$('[data-library-section]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.librarySection === state.librarySection)));
+  if (!state.selectedJob || !jobs.some(job => job.id === state.selectedJob)) state.selectedJob = jobs[0]?.id || null;
+  rememberLibrarySelection();
+  if (state.review && (state.review.jobId !== state.selectedJob || state.librarySection !== 'projects')) state.review = null;
   const jobList = $('#jobList');
-  const markup = state.jobs.map(job => `<button class="job-item ${job.id === state.selectedJob ? 'active' : ''}" data-job="${escapeHtml(job.id)}"><span class="job-item-title">${escapeHtml(jobTitle(job))}</span><span class="job-item-meta"><i class="${job.status === 'complete' ? 'ready' : job.status === 'failed' ? 'failed' : ''}"></i>${escapeHtml(statusName(job.status))}</span><span class="job-item-languages">${escapeHtml(jobLanguages(job).map(languageName).join(' · ') || 'Lip-sync com áudio')}</span></button>`).join('') || '<div class="empty-state"><span data-icon="folder"></span><h3>Seu espaço está pronto</h3><p>As suas criações aparecerão aqui.</p><button class="primary" data-new-project>Criar um projeto</button></div>';
+  const markup = jobs.map(job => `<button class="job-item ${job.id === state.selectedJob ? 'active' : ''}" data-job="${escapeHtml(job.id)}"><span class="job-item-title">${escapeHtml(jobTitle(job))}</span><span class="job-item-meta"><i class="${job.status === 'complete' ? 'ready' : job.status === 'failed' ? 'failed' : ''}"></i>${job.status === 'deleted' ? 'Na lixeira' : escapeHtml(statusName(job.status))}</span><span class="job-item-languages">${escapeHtml(jobLanguages(job).map(languageName).join(' · ') || 'Lip-sync com áudio')}</span></button>`).join('') || (state.librarySection === 'trash' ? '<div class="empty-state"><span data-icon="trash"></span><h3>Lixeira vazia</h3><p>Os projetos excluídos ficam aqui e podem ser restaurados.</p></div>' : '<div class="empty-state"><span data-icon="folder"></span><h3>Seu espaço está pronto</h3><p>As suas criações aparecerão aqui.</p><button class="primary" data-new-project>Criar um projeto</button></div>');
   // Unchanged polling must not replace focused/clicked project buttons.
   if (jobList.dataset.renderSignature !== markup) {
     jobList.innerHTML = markup;
     jobList.dataset.renderSignature = markup;
     paintIcons(jobList);
   }
-  const selected = state.jobs.find(job => job.id === state.selectedJob);
+  const selected = jobs.find(job => job.id === state.selectedJob);
   if (selected) renderJobDetail(selected);
-  else $('#jobDetail').innerHTML = '<div class="empty-state"><span data-icon="spark"></span><h3>Sua próxima criação começa aqui</h3><p>Escolha um vídeo ou transforme suas palavras em voz.</p><button class="primary" data-new-project>Começar um projeto</button></div>';
+  else $('#jobDetail').innerHTML = state.librarySection === 'trash' ? '<div class="empty-state"><span data-icon="trash"></span><h3>Seus arquivos continuam preservados</h3><p>Selecione um projeto da lixeira para restaurá-lo. Nenhum download ou arquivo externo ao Studio é apagado.</p></div>' : '<div class="empty-state"><span data-icon="spark"></span><h3>Sua próxima criação começa aqui</h3><p>Escolha um vídeo ou transforme suas palavras em voz.</p><button class="primary" data-new-project>Começar um projeto</button></div>';
   paintIcons($('#jobDetail'));
 }
 function detailSignature(job) {
-  return JSON.stringify([job.id, job.status, job.has_colab_package, job.has_output, job.has_report, job.error, outputsFor(job), Boolean(job.metadata?.review), job.options?.operation, job.options?.require_lipsync, notebookUrl()]);
+  return JSON.stringify([job.id, job.status, job.has_colab_package, job.has_output, job.has_report, job.error, outputsFor(job), Boolean(job.metadata?.review), job.options?.operation, job.options?.require_lipsync, job.options?.face_selection, Boolean(job.metadata?.face_selection_preparation_required), notebookUrl()]);
 }
 function renderOutput(job, output) {
   const language = output.language || output.code || 'original';
   const status = output.status || 'pending';
   const approved = ['complete', 'approved', 'validated'].includes(status);
-  const files = output.files || {};
-  const fileKinds = Array.isArray(files) ? files.map(file => typeof file === 'string' ? file : file.kind) : Object.keys(files);
+  const fileKinds = outputFileKinds(output);
   const names = { video: 'Baixar vídeo', wav: 'Áudio WAV', mp3: 'Áudio MP3', report: 'Relatório', original_srt: 'SRT original', translation_srt: 'SRT traduzido' };
   const links = approved ? fileKinds.filter(kind => names[kind]).map(kind => `<a href="${outputPath(job, language, kind)}" download class="${kind === 'video' || kind === 'wav' ? 'primary' : ''}">${names[kind]}</a>`).join('') : '';
   const isVideo = job.options?.operation !== 'text_to_voice';
   const confirmed = output.validation?.lipsync_confirmed === true || output.lipsync?.confirmed === true || output.report?.lipsync?.confirmed === true;
-  const lipBadge = isVideo ? job.options?.require_lipsync === false ? '<span class="status-badge">Sem lip-sync</span>' : approved && confirmed ? '<span class="status-badge ready">Lip-sync confirmado</span>' : '<span class="status-badge">Lip-sync não confirmado</span>' : '';
-  return `<section class="output-card"><div class="output-heading"><span data-icon="globe"></span><strong>${escapeHtml(languageName(language))}</strong><span class="status-badge ${approved ? 'ready' : status === 'failed' ? 'failed' : ''}">${approved ? 'Arquivos conferidos' : status === 'failed' ? 'Falhou' : 'Em validação'}</span>${lipBadge}</div>${links ? `<div class="output-files">${links}</div>` : ''}<p class="output-note">${escapeHtml(output.error || output.message || (approved ? 'Veja o relatório e confira a reprodução desta versão.' : 'O download será liberado quando a importação aprovar esta versão.'))}</p></section>`;
+  // The report proves application to confirmed face windows, not perceptual quality.
+  const lipBadge = isVideo ? job.options?.require_lipsync === false ? '<span class="status-badge">Sem lip-sync</span>' : approved && confirmed ? '<span class="status-badge ready">Lip-sync aplicado</span>' : '<span class="status-badge">Lip-sync não confirmado</span>' : '';
+  return `<section class="output-card"><div class="output-heading"><span data-icon="globe"></span><strong>${escapeHtml(languageName(language))}</strong><span class="status-badge ${approved ? 'ready' : status === 'failed' ? 'failed' : ''}">${approved ? 'Arquivos conferidos' : status === 'failed' ? 'Falhou' : 'Em validação'}</span>${lipBadge}</div>${links ? `<div class="output-files">${links}</div>` : ''}<p class="output-note">${escapeHtml(output.error || output.message || (approved ? 'Arquivos conferidos. Reproduza esta versão para conferir a qualidade.' : 'O download será liberado quando a importação conferir os arquivos desta versão.'))}</p></section>`;
 }
 function renderJobDetail(job) {
+  if (job.status === 'deleted') {
+    $('#jobDetail').innerHTML = `<div class="job-detail-content"><div class="job-kicker"><div><span class="eyebrow">PROJETO ${escapeHtml(job.id.toUpperCase())}</span><h2>${escapeHtml(jobTitle(job))}</h2></div><span class="status-badge">Na lixeira</span></div><p class="job-message">A cópia local deste projeto está preservada na lixeira. Restaurar devolve o projeto e seus arquivos à biblioteca, sem iniciar ou cancelar nada no Colab.</p><p class="settings-help">Downloads e arquivos originais fora do Studio continuam intactos.</p><div class="job-actions"><span class="quiet-label">Excluído em ${new Date(Number(job.deleted_at || 0) * 1000).toLocaleDateString('pt-BR')}</span><button class="secondary restore-button" type="button" data-action="restore">Restaurar projeto</button></div></div>`;
+    return;
+  }
   const legacy = job.status === 'legacy' || job.execution_location === 'legacy' || job.metadata?.legacy === true;
   const existing = $('[data-current-job]', $('#jobDetail'));
   const signature = detailSignature(job);
@@ -399,23 +560,24 @@ function renderJobDetail(job) {
     return; // Keep the video element intact during polling so playback never resets.
   }
   const outputs = outputsFor(job);
-  const playable = outputs.find(output => ['complete', 'approved', 'validated'].includes(output.status) && (output.files?.video || (Array.isArray(output.files) && output.files.includes('video'))));
-  const voice = outputs.find(output => ['complete', 'approved', 'validated'].includes(output.status) && output.files?.wav);
-  const isTts = job.options?.operation === 'text_to_voice';
-  const preview = playable ? `<video controls playsinline preload="metadata" class="job-preview" src="${outputPath(job, playable.language, 'video', true)}"></video>` : voice ? `<audio controls preload="metadata" class="job-preview audio" src="${outputPath(job, voice.language, 'wav', true)}"></audio>` : !isTts ? `<video controls playsinline preload="metadata" class="job-preview" src="${jobPath(job.id, '/source')}"></video>` : '';
+  const preview = renderJobPreview(job);
   if (legacy) {
-    $('#jobDetail').innerHTML = `<div class="job-detail-content" data-current-job="${escapeHtml(job.id)}"><div class="job-kicker"><div><span class="eyebrow">PROJETO ${escapeHtml(job.id.toUpperCase())}</span><h2>${escapeHtml(jobTitle(job))}</h2></div><span class="status-badge">Histórico preservado</span></div><p class="job-message" data-job-message>${escapeHtml(job.message || 'Arquivos anteriores preservados.')}</p>${preview}<p class="settings-help">Este projeto usa o formato antigo. Para processá-lo no Colab, crie um novo projeto em Dublar vídeo. Nenhuma tarefa antiga será retomada automaticamente.</p><div class="job-actions"><span class="quiet-label">${new Date(Number(job.created_at || 0) * 1000).toLocaleDateString('pt-BR')}</span><button class="archive-button" type="button" data-action="archive">Arquivar projeto</button></div></div>`;
+    $('#jobDetail').innerHTML = `<div class="job-detail-content" data-current-job="${escapeHtml(job.id)}"><div class="job-kicker"><div><span class="eyebrow">PROJETO ${escapeHtml(job.id.toUpperCase())}</span><h2>${escapeHtml(jobTitle(job))}</h2></div><span class="status-badge">Histórico preservado</span></div><p class="job-message" data-job-message>${escapeHtml(job.message || 'Arquivos anteriores preservados.')}</p>${preview}<p class="settings-help">Este projeto usa o formato antigo. Para processá-lo no Colab, crie um novo projeto em Dublar vídeo. Nenhuma tarefa antiga será retomada automaticamente.</p><div class="job-actions"><span class="quiet-label">${new Date(Number(job.created_at || 0) * 1000).toLocaleDateString('pt-BR')}</span><button class="archive-button" type="button" data-action="archive">Arquivar projeto</button><button class="delete-button" type="button" data-action="trash"><span data-icon="trash"></span>Excluir projeto</button></div></div>`;
     const legacyDetail = $('[data-current-job]', $('#jobDetail'));
     legacyDetail.dataset.signature = signature;
     paintIcons(legacyDetail);
     return;
   }
   const reviewAvailable = !legacy && (['review_required', 'awaiting_review'].includes(job.status) || job.metadata?.review || job.metadata?.review_available);
+  const repairAvailable = canRepairFace(job);
   const url = notebookUrl();
   const workflow = job.has_colab_package ? `<section class="colab-workflow"><div class="workflow-head"><span class="colab-symbol small">co</span><h3>Continue sua criação no Colab</h3></div><p>Baixe o pacote, abra o notebook e escolha o ZIP no seletor de upload. Execute as células e importe aqui o resultado final.</p><div class="inline-actions"><button class="primary" type="button" data-action="open-colab"><span data-icon="external"></span>Abrir no Colab</button><a href="${jobPath(job.id, '/colab-package')}" class="secondary" download><span data-icon="download"></span>Baixar pacote</a></div>${url ? '' : '<p class="settings-help">Salve o endereço público em Configurações, ou baixe o notebook .ipynb para abri-lo manualmente.</p><a class="text-link" href="/api/colab/notebook" download>Baixar notebook .ipynb</a>'}<label class="import-drop"><span data-icon="upload"></span><span>Importar resultado final (.zip)</span><input class="visually-hidden" type="file" data-import="result" accept=".zip,application/zip"></label><label class="import-drop"><span data-icon="translate"></span><span>Importar tradução para revisão (.zip)</span><input class="visually-hidden" type="file" data-import="review" accept=".zip,application/zip"></label></section>` : '<div class="external-progress"><span data-icon="folder"></span>Preparando seu pacote neste computador…</div>';
-  $('#jobDetail').innerHTML = `<div class="job-detail-content" data-current-job="${escapeHtml(job.id)}"><div class="job-kicker"><div><span class="eyebrow">PROJETO ${escapeHtml(job.id.toUpperCase())}</span><h2>${escapeHtml(jobTitle(job))}</h2></div><span class="status-badge ${job.status === 'complete' ? 'ready' : job.status === 'failed' ? 'failed' : ''}">${escapeHtml(statusName(job.status))}</span></div><p class="job-message" data-job-message>${escapeHtml(job.message || job.stage || '')}</p>${isExternal(job) ? '<div class="external-progress"><span data-icon="colab"></span>Execução no Colab — acompanhe pelo notebook</div>' : ''}${preview}${job.error ? `<div class="error-banner">${escapeHtml(job.error)}</div>` : ''}${workflow}${reviewAvailable ? '<section class="review-card"><h3>Revisão da tradução</h3><p>Confira e ajuste as falas antes de sintetizar as vozes. Os tempos originais serão mantidos.</p><div class="inline-actions"><button class="secondary" type="button" data-action="load-review">Abrir revisão</button></div><div id="reviewEditor"></div></section>' : ''}${outputs.length ? `<div class="result-header"><h3>Versões do seu projeto</h3><span class="quiet-label">${outputs.length} ${outputs.length === 1 ? 'idioma' : 'idiomas'}</span></div>${outputs.map(output => renderOutput(job, output)).join('')}` : ''}<div class="job-actions"><span class="quiet-label">${new Date(Number(job.created_at || 0) * 1000).toLocaleDateString('pt-BR')}</span><button class="archive-button" type="button" data-action="archive">Arquivar projeto</button></div></div>`;
+  $('#jobDetail').innerHTML = `<div class="job-detail-content" data-current-job="${escapeHtml(job.id)}"><div class="job-kicker"><div><span class="eyebrow">PROJETO ${escapeHtml(job.id.toUpperCase())}</span><h2>${escapeHtml(jobTitle(job))}</h2></div><span class="status-badge ${job.status === 'complete' ? 'ready' : job.status === 'failed' ? 'failed' : ''}">${escapeHtml(statusName(job.status))}</span></div><p class="job-message" data-job-message>${escapeHtml(job.message || job.stage || '')}</p>${isExternal(job) ? '<div class="external-progress"><span data-icon="colab"></span>Execução no Colab — acompanhe pelo notebook</div>' : ''}${preview}${job.error ? `<div class="error-banner">${escapeHtml(job.error)}</div>` : ''}${repairAvailable ? '<section class="review-card"><h3>Corrigir confirmação facial</h3><p>Marque o rosto no instante indicado pela falha. O notebook ainda verificará a trilha; a seleção não garante aprovação automática.</p><button class="secondary" type="button" data-action="repair-face">Selecionar rosto para retomada</button></section>' : ''}${job.status === 'awaiting_preparation' ? '<section class="review-card"><h3>Seleção salva</h3><p>Prepare um novo pacote corrigido. O pacote anterior permanece no histórico; isso não executa nada no Colab.</p><button class="primary" type="button" data-action="prepare-corrected">Preparar pacote corrigido</button></section>' : workflow}${reviewAvailable ? '<section class="review-card"><h3>Revisão da tradução</h3><p>Confira e ajuste as falas antes de sintetizar as vozes. Os tempos originais serão mantidos.</p><div class="inline-actions"><button class="secondary" type="button" data-action="load-review">Abrir revisão</button></div><div id="reviewEditor"></div></section>' : ''}${outputs.length ? `<div class="result-header"><h3>Versões do seu projeto</h3><span class="quiet-label">${outputs.length} ${outputs.length === 1 ? 'idioma' : 'idiomas'}</span></div>${outputs.map(output => renderOutput(job, output)).join('')}` : ''}<div class="job-actions"><span class="quiet-label">${new Date(Number(job.created_at || 0) * 1000).toLocaleDateString('pt-BR')}</span><button class="archive-button" type="button" data-action="archive">Arquivar projeto</button><button class="delete-button" type="button" data-action="trash"><span data-icon="trash"></span>Excluir projeto</button></div></div>`;
   const detail = $('[data-current-job]', $('#jobDetail'));
   detail.dataset.signature = signature;
+  // Keep the chooser bound to the project that created it, even if polling or
+  // another selection replaces the visible detail before its change event.
+  $$('[data-import]', detail).forEach(input => { input.dataset.importJob = job.id; });
   paintIcons(detail);
 }
 async function finishLaunchIfReady() {
@@ -445,12 +607,13 @@ async function openColab(job) {
   if (tab) tab.opener = null;
   downloadUrl(jobPath(job.id, '/colab-package'));
   if (!tab) { toast('A aba foi bloqueada. Permita pop-ups ou abra o notebook pelo link em Configurações.'); return; }
-  try { await api(jobPath(job.id, '/external-started'), { method: 'POST' }); await loadJobs({ quiet: true }); }
+  try { await api(jobPath(job.id, '/external-started'), { method: 'POST' }); await loadJobs({ quiet: true, invalidate: true }); }
   catch (error) { toast(error.message); }
 }
 async function importPackage(input) {
   const file = input.files[0];
-  const job = state.jobs.find(item => item.id === state.selectedJob);
+  const jobId = input.dataset.importJob || input.closest?.('[data-current-job]')?.dataset.currentJob;
+  const job = state.jobs.find(item => item.id === jobId);
   if (!file || !job) return;
   const review = input.dataset.import === 'review';
   const form = new FormData(); form.append(review ? 'review' : 'result', file);
@@ -458,29 +621,39 @@ async function importPackage(input) {
   toast(review ? 'Importando a tradução para revisão…' : 'Conferindo o pacote e os arquivos de resultado…');
   try {
     await api(jobPath(job.id, review ? '/review' : '/colab-result'), { method: 'POST', body: form });
-    await loadJobs({ quiet: true });
-    if (review) await loadReview(job);
+    await loadJobs({ quiet: true, invalidate: true });
+    if (review && state.selectedJob === jobId && state.librarySection === 'projects') await loadReview(job);
     toast(review ? 'Tradução disponível para você revisar.' : 'Pacote recebido. Confira o estado de cada idioma.');
   } catch (error) { toast(error.message); }
   finally { input.disabled = false; input.value = ''; }
 }
+function reviewEditorForJob(jobId) {
+  if (state.selectedJob !== jobId || state.librarySection !== 'projects') return null;
+  const detail = $('[data-current-job]', $('#jobDetail'));
+  return detail?.dataset.currentJob === jobId ? $('#reviewEditor', detail) : null;
+}
 async function loadReview(job) {
+  const editor = reviewEditorForJob(job.id);
+  if (!editor) return;
+  const request = ++state.reviewRequest;
   try {
     const payload = await api(jobPath(job.id, '/review'));
+    // Reject responses for replaced editors (including A -> B -> A) and older
+    // requests for the same editor before mutating review state or the DOM.
+    if (request !== state.reviewRequest || reviewEditorForJob(job.id) !== editor) return;
     const review = payload.review || payload;
     const translations = review.translations || {};
     state.review = { jobId: job.id, payload: structuredClone(review), translations };
-    const editor = $('#reviewEditor');
-    if (!editor) return;
     editor.innerHTML = `<div class="review-scroll">${Object.entries(translations).map(([language, segments]) => `<h4 class="review-language">${escapeHtml(languageName(language))}</h4>${(Array.isArray(segments) ? segments : segments.segments || []).map((segment, index) => `<div class="review-segment"><small>${formatDuration(segment.start)} → ${formatDuration(segment.end)} · ${escapeHtml(segment.source_text || segment.original || segment.text || '')}</small><textarea data-review-language="${escapeHtml(language)}" data-review-index="${index}" aria-label="Tradução ${escapeHtml(languageName(language))}, trecho ${index + 1}">${escapeHtml(segment.translated_text || segment.translation || '')}</textarea></div>`).join('')}`).join('')}</div><div class="inline-actions"><button class="primary" type="button" data-action="save-review">Aprovar e baixar revisão</button></div>`;
     if (!Object.keys(translations).length) editor.innerHTML = '<p class="settings-help">Nenhuma tradução disponível neste pacote.</p>';
-  } catch (error) { toast(error.message); }
+  } catch (error) { if (request === state.reviewRequest && reviewEditorForJob(job.id) === editor) toast(error.message); }
 }
 async function saveReview(job, button) {
-  if (!state.review || state.review.jobId !== job.id) return;
+  const editor = reviewEditorForJob(job.id);
+  if (!editor || !state.review || state.review.jobId !== job.id) return;
   button.disabled = true;
   const translations = structuredClone(state.review.translations);
-  $$('[data-review-language]').forEach(input => {
+  $$('[data-review-language]', editor).forEach(input => {
     const value = translations[input.dataset.reviewLanguage];
     const segments = Array.isArray(value) ? value : value.segments;
     const segment = segments[Number(input.dataset.reviewIndex)];
@@ -490,26 +663,145 @@ async function saveReview(job, button) {
     const payload = await api(jobPath(job.id, '/review-approved'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...state.review.payload, translations }) });
     downloadUrl(payload.download_url || payload.url || payload.package_url || jobPath(job.id, '/review-approved'));
     toast('Revisão aprovada. Envie este ZIP no notebook para retomar a geração das vozes.');
-    await loadJobs({ quiet: true });
+    await loadJobs({ quiet: true, invalidate: true });
   } catch (error) { toast(error.message); }
   finally { button.disabled = false; }
+}
+function canRepairFace(job) {
+  return ['failed', 'awaiting_colab', 'awaiting_import', 'review_required', 'review_approved', 'awaiting_preparation'].includes(job.status)
+    && ['dub_video', 'lipsync_video'].includes(job.options?.operation) && job.options?.require_lipsync === true
+    && !outputsFor(job).some(output => ['complete', 'approved', 'validated'].includes(output.status));
+}
+function faceRepairSelection(values, duration, width, height) {
+  const [time, x, y, w, h] = values.map(Number);
+  if (![time,x,y,w,h,duration,width,height].every(Number.isFinite) || time < 0 || time >= duration
+      || x < 0 || y < 0 || w <= 0 || h <= 0 || x+w > 1 || y+h > 1 || w*width < 20 || h*height < 20) return null;
+  return {bbox:[x,y,w,h], normalized:true, frame_time:time};
+}
+function repairFace(job) {
+  if (!canRepairFace(job) || $('#faceRepairDialog')) return;
+  const dialog = document.createElement('dialog');
+  dialog.id = 'faceRepairDialog'; dialog.className = 'project-action-dialog face-repair-dialog';
+  dialog.setAttribute('aria-labelledby', 'faceRepairTitle');
+  dialog.innerHTML = `<h2 id="faceRepairTitle">Selecionar rosto para retomada</h2><p>Informe o instante da cena, depois arraste um retângulo sobre o rosto falante. A seleção vale somente para a trilha detectada nesse instante; outros rostos continuam sendo verificados.</p><label>Instante da cena (segundos)<input id="repairTime" type="number" min="0" step="0.01" value="0"></label><div class="face-repair-video-wrap"><video id="repairVideo" muted preload="metadata" src="${jobPath(job.id, '/source')}"></video><div id="repairOverlay" class="face-repair-overlay" aria-label="Arraste para selecionar o rosto"><div id="repairBox" hidden></div></div></div><details><summary>Coordenadas normalizadas da seleção</summary><div class="face-repair-coordinates">${['X','Y','Largura','Altura'].map((label,i)=>`<label>${label}<input data-repair-coordinate="${i}" aria-label="${label} da seleção facial" type="number" min="0" max="1" step="0.001" value="0"></label>`).join('')}</div></details><p id="repairError" role="status"></p><div class="project-dialog-actions"><button class="secondary" type="button" data-cancel-repair>Cancelar</button><button class="primary" type="button" data-save-repair>Salvar seleção facial</button></div>`;
+  document.body.append(dialog);
+  const video = $('#repairVideo',dialog), overlay = $('#repairOverlay',dialog), box = $('#repairBox',dialog), time = $('#repairTime',dialog);
+  const coordinates = $$('[data-repair-coordinate]',dialog);
+  const previousFocus = document.activeElement;
+  let start = null;
+  const close = () => { video.pause(); if (dialog.open) dialog.close(); dialog.remove(); previousFocus?.focus?.(); };
+  const geometry = () => { const bounds=overlay.getBoundingClientRect(), scale=Math.min(bounds.width/video.videoWidth,bounds.height/video.videoHeight); return {bounds,scale,ox:(bounds.width-video.videoWidth*scale)/2,oy:(bounds.height-video.videoHeight*scale)/2}; };
+  const point = event => { const g=geometry(); if (!Number.isFinite(g.scale) || g.scale<=0) return null; return {x:Math.max(0,Math.min(1,(event.clientX-g.bounds.left-g.ox)/(video.videoWidth*g.scale))),y:Math.max(0,Math.min(1,(event.clientY-g.bounds.top-g.oy)/(video.videoHeight*g.scale)))}; };
+  const draw = () => { const [x,y,w,h]=coordinates.map(input=>Number(input.value)),g=geometry(); if (![x,y,w,h,g.scale].every(Number.isFinite)||g.scale<=0||w<=0||h<=0) {box.hidden=true;return;} Object.assign(box.style,{left:`${g.ox+x*video.videoWidth*g.scale}px`,top:`${g.oy+y*video.videoHeight*g.scale}px`,width:`${w*video.videoWidth*g.scale}px`,height:`${h*video.videoHeight*g.scale}px`});box.hidden=false; };
+  const seekSelection = () => { const t=Number(time.value); if(Number.isFinite(video.duration)&&t>=0&&t<video.duration)video.currentTime=t; };
+  time.addEventListener('input',seekSelection); time.addEventListener('change',seekSelection);
+  video.addEventListener('loadedmetadata',()=>{const current=job.options?.face_selection;if(current&&typeof current==='object'){time.value=current.frame_time;coordinates.forEach((input,i)=>input.value=current.bbox[i]);}seekSelection();draw();});
+  coordinates.forEach(input=>input.addEventListener('input',draw));
+  overlay.addEventListener('pointerdown',event=>{ if(event.button!==0)return; start=point(event); if(start){event.preventDefault();overlay.setPointerCapture(event.pointerId);} });
+  const move = event => { const end=point(event);if(!start||!end)return;const values=[Math.min(start.x,end.x),Math.min(start.y,end.y),Math.abs(end.x-start.x),Math.abs(end.y-start.y)];coordinates.forEach((input,i)=>input.value=values[i].toFixed(6));draw(); };
+  overlay.addEventListener('pointermove',move);overlay.addEventListener('pointerup',event=>{move(event);start=null;});overlay.addEventListener('pointercancel',()=>start=null);
+  $('[data-cancel-repair]',dialog).addEventListener('click',close);
+  dialog.addEventListener('cancel',event=>{event.preventDefault();close();});
+  $('[data-save-repair]',dialog).addEventListener('click',async event=>{const selection=faceRepairSelection([time.value,...coordinates.map(input=>input.value)],video.duration,video.videoWidth,video.videoHeight);if(!selection){$('#repairError',dialog).textContent='Marque uma área válida do rosto e um instante dentro do vídeo.';return;}event.currentTarget.disabled=true;try{await api(jobPath(job.id,'/face-selection'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({face_selection:selection})});close();await loadJobs();toast('Seleção salva. Prepare o pacote corrigido para enviar ao Colab.');}catch(error){$('#repairError',dialog).textContent=error.message;event.currentTarget.disabled=false;}});
+  dialog.showModal(); $('[data-cancel-repair]',dialog).focus();
+}
+function confirmProjectAction(job, restoring = false) {
+  if ($('#projectActionDialog')) return Promise.resolve(false);
+  return new Promise(resolve => {
+    const previousFocus = document.activeElement;
+    const dialog = document.createElement('dialog');
+    dialog.id = 'projectActionDialog';
+    dialog.className = 'project-action-dialog';
+    dialog.setAttribute('aria-labelledby', 'projectActionTitle');
+    dialog.setAttribute('aria-describedby', 'projectActionDescription');
+    const heading = document.createElement('h2');
+    heading.id = 'projectActionTitle';
+    heading.textContent = restoring ? 'Restaurar projeto?' : 'Excluir projeto?';
+    const description = document.createElement('p');
+    description.id = 'projectActionDescription';
+    description.textContent = restoring
+      ? `Restaurar “${jobTitle(job)}” à biblioteca? Seus arquivos voltam a ficar disponíveis. Isso não inicia a execução no Colab.`
+      : `Excluir “${jobTitle(job)}” da biblioteca? A cópia local será movida para a Lixeira e poderá ser restaurada. Downloads e arquivos originais fora do Studio ficam intactos.`;
+    dialog.append(heading, description);
+    if (!restoring && isExternal(job)) {
+      const warning = document.createElement('p');
+      warning.className = 'project-action-warning';
+      warning.textContent = 'Atenção: isso NÃO cancela a execução no Colab. Acompanhe ou interrompa o processamento no próprio notebook.';
+      dialog.append(warning);
+      warning.id = 'projectActionWarning';
+      dialog.setAttribute('aria-describedby', 'projectActionDescription projectActionWarning');
+    }
+    const actions = document.createElement('div');
+    actions.className = 'project-dialog-actions';
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'secondary';
+    cancel.textContent = 'Cancelar';
+    const confirm = document.createElement('button');
+    confirm.type = 'button';
+    confirm.className = restoring ? 'primary' : 'delete-button';
+    confirm.textContent = restoring ? 'Restaurar projeto' : 'Excluir projeto';
+    actions.append(cancel, confirm);
+    dialog.append(actions);
+    let settled = false;
+    function finish(accepted) {
+      if (settled) return;
+      settled = true;
+      if (dialog.open) dialog.close();
+      dialog.remove();
+      previousFocus?.focus?.();
+      resolve(accepted);
+    }
+    cancel.addEventListener('click', () => finish(false));
+    confirm.addEventListener('click', () => finish(true));
+    dialog.addEventListener('cancel', event => { event.preventDefault(); finish(false); });
+    dialog.addEventListener('close', () => finish(false));
+    document.body.append(dialog);
+    try {
+      dialog.showModal();
+      cancel.focus(); // Cancellation is always the safe default keyboard action.
+    } catch (_) { finish(false); }
+  });
 }
 async function jobAction(event) {
   const button = event.target.closest('[data-action]');
   if (!button) return;
-  const job = state.jobs.find(item => item.id === state.selectedJob);
+  const job = visibleJobs().find(item => item.id === state.selectedJob);
   if (!job) return;
+  if (button.dataset.action === 'trash' || button.dataset.action === 'restore') {
+    const restoring = button.dataset.action === 'restore';
+    if (!await confirmProjectAction(job, restoring)) return;
+    button.disabled = true;
+    try {
+      await api(restoring ? `/api/trash/${encodeURIComponent(job.id)}/restore` : jobPath(job.id, '/trash'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ confirm: true }) });
+      if (restoring) state.librarySection = 'projects';
+      if (!restoring && state.launchPending?.id === job.id) state.launchPending = null;
+      state.selectedJob = restoring ? job.id : null;
+      state.review = null;
+      await loadJobs();
+      toast(restoring ? 'Projeto restaurado. Seus arquivos estão disponíveis novamente.' : 'Projeto movido para a Lixeira. Você pode restaurá-lo quando quiser.');
+    } catch (error) { button.disabled = false; toast(error.message); }
+    return;
+  }
   if (button.dataset.action === 'open-colab') return openColab(job);
+  if (button.dataset.action === 'repair-face') return repairFace(job);
+  if (button.dataset.action === 'prepare-corrected') {
+    button.disabled = true;
+    try { await api(jobPath(job.id, '/prepare-colab'), {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:true})});await loadJobs();toast('Preparando o pacote corrigido neste computador. Nenhuma GPU foi iniciada.'); }
+    catch(error) {button.disabled=false;toast(error.message);}
+    return;
+  }
   if (button.dataset.action === 'load-review') return loadReview(job);
   if (button.dataset.action === 'save-review') return saveReview(job, button);
   if (button.dataset.action === 'archive') {
     if (!window.confirm('Arquivar este projeto? Os arquivos serão preservados.')) return;
     button.disabled = true;
-    try { await api(jobPath(job.id), { method: 'DELETE' }); state.selectedJob = null; await loadJobs(); toast('Projeto arquivado. Os arquivos foram preservados.'); }
+    try { await api(jobPath(job.id), { method: 'DELETE' }); if (state.launchPending?.id === job.id) state.launchPending = null; state.selectedJob = null; await loadJobs(); toast('Projeto arquivado. Os arquivos foram preservados.'); }
     catch (error) { button.disabled = false; toast(error.message); }
   }
 }
 function bindEvents() {
+  installLibraryFilter();
   $$('.nav-item').forEach(button => button.addEventListener('click', () => showView(button.dataset.view)));
   $('.brand').addEventListener('click', event => { event.preventDefault(); showView('dub'); });
   window.addEventListener('hashchange', () => showView(location.hash.slice(1), { updateHash: false }));
@@ -560,11 +852,17 @@ function bindEvents() {
   $('#refreshJobs').addEventListener('click', async event => { const button = event.currentTarget; button.disabled = true; await Promise.all([loadJobs(), checkHealth()]); button.disabled = false; });
   $('#jobList').addEventListener('click', event => { const button = event.target.closest('[data-job]'); if (!button) return; state.selectedJob = button.dataset.job; renderJobs(); });
   $('#jobDetail').addEventListener('click', jobAction);
-  $('#jobDetail').addEventListener('change', event => { if (event.target.matches('[data-import]')) importPackage(event.target); });
+  $('#jobDetail').addEventListener('change', event => {
+    if (event.target.matches('[data-preview-language]')) {
+      const job = state.jobs.find(item => item.id === state.selectedJob);
+      if (job) selectJobPreview(job, event.target.value);
+    } else if (event.target.matches('[data-import]')) importPackage(event.target);
+  });
   document.addEventListener('click', event => { if (event.target.closest('[data-new-project]')) showView('dub'); });
   document.addEventListener('visibilitychange', () => { if (!document.hidden) { loadJobs({ quiet: true }); checkHealth(); } });
 }
 async function init() {
+  restoreLibrarySelection();
   paintIcons(); bindEvents(); showView(location.hash.slice(1) || 'dub', { updateHash: false });
   const results = await Promise.allSettled([loadCatalog(), loadSettings(), checkHealth(), loadJobs({ quiet: true })]);
   results.forEach(result => { if (result.status === 'rejected') toast(result.reason.message); });

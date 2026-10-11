@@ -8,6 +8,7 @@ do runtime. Cada estágio confirmado é salvo no Drive e pode ser retomado.
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
 import hashlib
 import json
@@ -22,6 +23,7 @@ import sys
 import time
 import zipfile
 import codecs
+from fractions import Fraction
 from pathlib import Path
 from typing import Callable
 
@@ -31,7 +33,9 @@ SCHEMA_VERSION = "1.0"
 # rosto falante. Em vídeo que muda de cena, só essa janela recebe MuseTalk;
 # os demais quadros originais são preservados, nunca recebem uma caixa facial
 # inventada e nunca são aceitos como vídeo congelado.
-LIPSYNC_CACHE_REVISION = "musetalk-talknet-multisegment-v15-source-timeline"
+LIPSYNC_CACHE_REVISION = "musetalk-talknet-multisegment-v21-source-landmarks-perioral"
+CANONICAL_FACE_FPS = 25
+TALKNET_NORMALIZATION_REVISION = "canonical-pts-fps25-pcm-v1"
 TALKNET_TIMELINE_TOLERANCE_SECONDS = 0.15
 CHATTERBOX_LANGUAGES = {
     "ar", "da", "de", "el", "en", "es", "fi", "fr", "he", "hi", "it", "ja",
@@ -178,11 +182,29 @@ def sha256(path: Path) -> str:
 def ffprobe(path: Path) -> dict:
     result = run([
         "ffprobe", "-v", "error", "-show_entries",
-        "format=duration:stream=codec_type,width,height,channels,sample_rate", "-of", "json", str(path),
+        "format=duration,format_name:stream=codec_type,duration,width,height,channels,sample_rate,r_frame_rate,avg_frame_rate", "-of", "json", str(path),
     ])
     payload = json.loads(result.stdout)
     fmt = payload.get("format", {})
-    return {"duration": float(fmt.get("duration") or 0), "streams": payload.get("streams", [])}
+    payload["_media_path"] = str(path)
+    kind = "video" if any(item.get("codec_type") == "video" for item in payload.get("streams", [])) else "audio"
+    try:
+        duration = _measured_input_duration(payload, kind)
+    except RuntimeError as exc:
+        raise WorkerError(str(exc)) from exc
+    selected = next(item for item in payload["streams"] if item.get("codec_type") == kind)
+    selected["duration"] = duration
+    return {"duration": duration, "container_duration": float(fmt.get("duration") or 0), "format": fmt, "streams": payload.get("streams", [])}
+
+
+def _measured_input_duration(info: dict, kind: str) -> float:
+    # Both the standalone worker and local Studio import the same public helper;
+    # it imports no models and adds no new package/module to notebooks.
+    try:
+        from .dubstudio_runner_v2 import input_stream_duration
+    except ImportError:
+        from dubstudio_runner_v2 import input_stream_duration
+    return input_stream_duration(info, kind)
 
 
 def video_frame_count(path: Path) -> int:
@@ -205,14 +227,11 @@ def video_stream_duration(path: Path) -> float:
     FFprobe parece correto e a última imagem fica congelada.  A aprovação do
     lip-sync precisa medir especificamente ``v:0``.
     """
-    result = run([
-        "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-        "stream=duration", "-of", "default=nokey=1:noprint_wrappers=1", str(path),
-    ])
+    info = ffprobe(path)
     try:
-        return float(result.stdout.strip().splitlines()[-1])
-    except (IndexError, ValueError):
-        raise WorkerError("A faixa de vídeo produzida não possui duração mensurável.") from None
+        return _measured_input_duration({**info, "_media_path": str(path)}, "video")
+    except RuntimeError as exc:
+        raise WorkerError(str(exc)) from exc
 
 
 def assert_video_stream_coverage(rendered: Path, source: Path, tolerance: float = 0.5) -> None:
@@ -226,6 +245,84 @@ def assert_video_stream_coverage(rendered: Path, source: Path, tolerance: float 
             "O renderizador de lip-sync gerou imagem por apenas "
             f"{actual:.3f}s de {expected:.3f}s. O áudio não será combinado com vídeo incompleto."
         )
+
+
+def confirmed_face_minimum_frames(segment: dict, default: int = 20) -> int:
+    """Validate a narrow user-selected exception; summaries alone are no proof.
+
+    Short windows contain the original detected boxes and per-frame scores.
+    The worker recalculates every count, ratio and digest before relaxing its
+    minimum. This is a consistency contract, not a cryptographic attestation
+    that a human reviewed MuseTalk's visual output.
+    """
+    if not isinstance(segment, dict):
+        raise WorkerError("O trecho facial não possui uma estrutura válida.")
+    proof = segment.get("explicit_selected_short_track")
+    if proof is None:
+        return default
+    message = "A prova do trecho facial curto selecionado é inválida."
+    try:
+        start, end = segment["start_frame"], segment["end_frame"]
+        boxes, track_id = segment["boxes"], segment["track_id"]
+        count = end - start
+        if (
+            not isinstance(proof, dict)
+            or type(start) is not int or type(end) is not int
+            or type(track_id) is not int or track_id < 0
+            or not isinstance(boxes, list) or len(boxes) != count
+            or not 12 <= count < 20
+            or type(segment["fps"]) not in {int, float} or float(segment["fps"]) != 25.0
+            or segment.get("face_confirmation") != "user_selected"
+            or segment.get("selection_source") not in {"track_id", "bbox"}
+            or proof.get("selection_source") != segment["selection_source"]
+            or type(proof.get("schema_version")) is not int or proof.get("schema_version") != 1
+            or proof.get("policy") != "explicit-user-selected-short-track-v1"
+            or type(proof.get("minimum_frames")) is not int or proof.get("minimum_frames") != 12
+            or any(type(proof.get(key)) is not int for key in ("track_id", "start_frame", "end_frame", "frame_count"))
+            or proof.get("track_id") != track_id
+            or proof.get("start_frame") != start or proof.get("end_frame") != end
+            or proof.get("frame_count") != count or proof.get("fps") != 25.0
+            or any(not isinstance(box, list) or len(box) != 4
+                   or any(type(value) is not int for value in box)
+                   or min(box) < 0 or box[2] - box[0] < 24 or box[3] - box[1] < 24 for box in boxes)
+        ):
+            raise WorkerError(message)
+        digest = hashlib.sha256(json.dumps(boxes, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+        if proof.get("boxes_sha256") != digest:
+            raise WorkerError(message)
+        operation = proof.get("operation")
+        if operation == "lipsync_video":
+            if (
+                segment.get("speaker_confirmation") != "external_audio"
+                or proof.get("score_evidence_required") is not False
+                or proof.get("scores") != []
+                or any(proof.get(key) is not None for key in ("finite_score_count", "positive_score_count", "positive_score_ratio", "peak_score"))
+            ):
+                raise WorkerError(message)
+        elif operation == "dub_video":
+            values = proof.get("scores")
+            if (
+                segment.get("speaker_confirmation") != "user_selected"
+                or proof.get("score_evidence_required") is not True
+                or not isinstance(values, list) or len(values) != count
+                or any(type(value) not in {int, float} or not math.isfinite(value) for value in values)
+            ):
+                raise WorkerError(message)
+            positive, peak = sum(value > 0 for value in values), max(values)
+            if (
+                positive * 5 < count * 4 or peak < 0.8
+                or type(proof.get("finite_score_count")) is not int or proof.get("finite_score_count") != count
+                or type(proof.get("positive_score_count")) is not int or proof.get("positive_score_count") != positive
+                or type(proof.get("positive_score_ratio")) not in {int, float}
+                or not math.isclose(proof["positive_score_ratio"], positive / count, rel_tol=0, abs_tol=1e-12)
+                or type(proof.get("peak_score")) not in {int, float} or proof.get("peak_score") != peak
+            ):
+                raise WorkerError(message)
+        else:
+            raise WorkerError(message)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        raise WorkerError(message) from None
+    return 12
 
 
 def bound_confirmed_talknet_segments(
@@ -255,6 +352,7 @@ def bound_confirmed_talknet_segments(
     clipped = []
     previous_end = 0.0
     for index, raw in enumerate(raw_segments, start=1):
+        segment_minimum = confirmed_face_minimum_frames(raw, minimum_frames)
         try:
             start_frame, end_frame = int(raw["start_frame"]), int(raw["end_frame"])
             fps = float(raw["fps"])
@@ -265,7 +363,7 @@ def bound_confirmed_talknet_segments(
         if (
             not integral_frames or start_frame < 0 or not math.isfinite(fps)
             or not 1 <= fps <= 120 or len(boxes) != end_frame - start_frame
-            or len(boxes) < minimum_frames
+            or len(boxes) < segment_minimum
         ):
             raise WorkerError(f"O trecho facial {index} não cobre uma janela segura.")
         start_seconds, raw_end_seconds = start_frame / fps, end_frame / fps
@@ -279,8 +377,10 @@ def bound_confirmed_talknet_segments(
         # inside v:0. Slice the tail rather than resampling/relabeling the boxes.
         bounded_end = min(end_frame, math.floor(source_duration * fps + 1e-6))
         retained_frames = bounded_end - start_frame
-        if retained_frames < minimum_frames:
+        if retained_frames < segment_minimum:
             raise WorkerError(f"O trecho facial {index} fica vazio ou curto demais na faixa de vídeo original.")
+        if raw.get("explicit_selected_short_track") is not None and bounded_end != end_frame:
+            raise WorkerError("A faixa de vídeo original recorta a prova do trecho facial curto selecionado; revise a seleção.")
         segment = dict(raw)
         segment.update(start_frame=start_frame, end_frame=bounded_end, fps=fps, boxes=boxes[:retained_frames])
         bounded.append(segment)
@@ -1197,15 +1297,143 @@ def mix_audio(background: Path, dub: Path, duration: float, job_dir: Path, log: 
         "[0:a]aformat=sample_rates=48000:channel_layouts=stereo,volume=0.95[bg];"
         "[1:a]aformat=sample_rates=48000:channel_layouts=stereo,volume=1.0[voice];"
         "[bg][voice]amix=inputs=2:duration=longest:dropout_transition=0,"
-        "loudnorm=I=-14:TP=-1.5:LRA=11[out]", "-map", "[out]", "-t", str(duration), str(output),
+        "loudnorm=I=-14:TP=-1.5:LRA=11[out]", "-map", "[out]", "-t", str(duration),
+        # Dynamic loudnorm internally upsamples to 192 kHz for true-peak
+        # detection. Constrain only its output; do not trim speech or change
+        # the filter, input clock, loudness targets or duration contract.
+        "-ar", "48000", "-ac", "2", "-c:a", "pcm_s16le", str(output),
     ], log=log)
     return output
+
+
+def canonical_talknet_source(source: str) -> str:
+    """Repair only the pinned whole/partial AVI conversion commands.
+
+    AVI's default encoded audio can pad the video with leading frames. An
+    explicit timestamp-based fps filter plus PCM audio avoids that encoder
+    delay. Detection and rendering must consume the same normalized timeline.
+    """
+    old = "-async 1 -r 25"
+    new = "-async 1 -vf 'setpts=PTS-STARTPTS,fps=25:start_time=0' -c:a pcm_s16le"
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        raise WorkerError("O código do TalkNet não possui estrutura válida.") from exc
+    commands = [node.value for node in ast.walk(tree)
+                if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                and node.value.startswith("ffmpeg -y -i %s -qscale:v 2 -threads %d ")
+                and "-async " in node.value]
+    # The same prefix is also used for image extraction; it is not a normalizer.
+    if len(commands) != 2:
+        raise WorkerError("Os comandos de normalização do TalkNet mudaram; atualização segura necessária.")
+    if all(new in command and old not in command for command in commands) and source.count(new) == 2:
+        return source
+    if not all(old in command for command in commands) or source.count(old) != 2 or new in source:
+        raise WorkerError("A normalização do TalkNet está alterada ou incompleta; não será usada.")
+    repaired = source.replace(old, new)
+    ast.parse(repaired)
+    return repaired
+
+
+def patch_musetalk_audio_frame_clock(root: "Path") -> dict:
+    """Repair only the audited pinned PCM counters; no media is extended.
+
+    This function is extractable on its own for an existing runtime: it uses
+    only stdlib, verifies the Git commit and both AST expressions, and never
+    changes packages, models, checkpoints, frame guards or tolerance values.
+    """
+    import ast
+    import hashlib
+    import subprocess
+    from pathlib import Path
+
+    root = Path(root)
+    commit = "0a89dec45a0192b824e3cf4daf96c239440c5ed8"
+    revision = "musetalk-pcm-integer-frame-clock-v1"
+    try:
+        result = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                                capture_output=True, text=True, check=True)
+        if result.stdout.strip() != commit:
+            raise RuntimeError("O contador de áudio do MuseTalk exige a revisão de código fixada; fonte desconhecida recusada.")
+        path = root / "musetalk/utils/audio_processor.py"
+        before = path.read_bytes()
+        source = before.decode("utf-8")
+        tree = ast.parse(source)
+        classes = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AudioProcessor"]
+        methods = [node for cls in classes for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "get_whisper_chunk"]
+        if len(classes) != 1 or len(methods) != 1:
+            raise ValueError("método incompatível")
+        method = methods[0]
+        expected = {
+            "sr": "16000", "audio_fps": "50", "fps": "int(fps)",
+            "num_frames": "math.floor((librosa_length / sr) * fps)",
+            "actual_length": "math.floor((librosa_length / sr) * audio_fps)",
+        }
+        corrected = {"num_frames": "(librosa_length * fps) // sr",
+                     "actual_length": "(librosa_length * audio_fps) // sr"}
+        assignments = {}
+        for node in ast.walk(method):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                name = node.targets[0].id
+                if name in expected:
+                    if name in assignments or node not in method.body:
+                        raise ValueError("contador duplicado ou condicional")
+                    assignments[name] = node
+        if set(assignments) != set(expected):
+            raise ValueError("contadores ausentes")
+        dump = lambda value: ast.dump(ast.parse(value, mode="eval").body, include_attributes=False)
+        for name in ("sr", "audio_fps", "fps"):
+            if ast.dump(assignments[name].value, include_attributes=False) != dump(expected[name]):
+                raise ValueError("relógio incompatível")
+        before_clock = all(ast.dump(assignments[name].value, include_attributes=False) == dump(expected[name]) for name in corrected)
+        after_clock = all(ast.dump(assignments[name].value, include_attributes=False) == dump(corrected[name]) for name in corrected)
+        if not (before_clock or after_clock):
+            raise ValueError("contador desconhecido ou correção parcial")
+        after = before
+        if before_clock:
+            lines = source.splitlines(keepends=True)
+            for name, expression in corrected.items():
+                node = assignments[name]
+                if node.end_lineno != node.lineno:
+                    raise ValueError("contador multilinha incompatível")
+                line = lines[node.lineno - 1]
+                indent = line[:len(line) - len(line.lstrip())]
+                newline = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+                lines[node.lineno - 1] = f"{indent}{name} = {expression}{newline}"
+            patched = "".join(lines)
+            compile(patched, str(path), "exec")
+            after = patched.encode("utf-8")
+            temporary = path.with_name(".dubstudio-audio-frame-clock.tmp")
+            temporary.write_bytes(after)
+            temporary.replace(path)
+            if path.read_bytes() != after:
+                raise OSError("não foi possível confirmar o código corrigido")
+    except (OSError, UnicodeError, SyntaxError, ValueError, subprocess.CalledProcessError) as error:
+        raise RuntimeError("A correção segura do relógio PCM do MuseTalk recusou uma fonte incompatível; nenhum resultado foi aprovado.") from error
+    return {"revision": revision, "commit": commit, "changed": before != after,
+            "source_sha256_before": hashlib.sha256(before).hexdigest(),
+            "source_sha256_after": hashlib.sha256(after).hexdigest()}
+
+
+def patch_talknet_video_normalization(root: Path) -> str:
+    target = root / "demoTalkNet.py"
+    source = target.read_text(encoding="utf-8")
+    repaired = canonical_talknet_source(source)
+    if repaired != source:
+        backup = target.with_suffix(".py.dubstudio-normalization-original")
+        if not backup.exists():
+            shutil.copy2(target, backup)
+        temporary = target.with_suffix(".py.normalization-writing")
+        temporary.write_text(repaired, encoding="utf-8")
+        temporary.replace(target)
+    return TALKNET_NORMALIZATION_REVISION
 
 
 def talknet_analysis(video: Path, job_dir: Path, log: Path) -> dict:
     root = Path(os.environ.get("DUBSTUDIO_TALKNET_ROOT", "/content/TalkNet-ASD"))
     if not root.exists():
         return {"status": "unavailable", "safe_for_single_face_lipsync": False, "ambiguous_intervals": []}
+    normalization_revision = patch_talknet_video_normalization(root)
     # TalkNet still uses the removed NumPy alias ``np.int``.  Patch the
     # narrow call site instead of downgrading NumPy for the whole pipeline.
     box_utils = root / "model/faceDetector/s3fd/box_utils.py"
@@ -1355,6 +1583,7 @@ def talknet_analysis(video: Path, job_dir: Path, log: Path) -> dict:
         coordinate_status = "vídeo normalizado do TalkNet indisponível"
     return {
         "status": "complete", "safe_for_single_face_lipsync": safe,
+        "normalization_revision": normalization_revision,
         "tracks": len(tracks), "ambiguous_intervals": intervals,
         "fast_coordinates": fast_coordinates,
         "coordinate_cache": coordinate_status,
@@ -1447,31 +1676,16 @@ def compose_confirmed_face_segment(
     segment_duration: float,
     job_dir: Path,
     log: Path,
+    face_boxes: object = None,
+    box_fps: float = 0.0,
+    box_size: tuple[int, int] | None = None,
 ) -> Path:
-    """Substitui só a janela labial confirmada e preserva o restante visual."""
-    source_meta = ffprobe(source_video)
-    stream = next((item for item in source_meta["streams"] if item.get("codec_type") == "video"), {})
-    width, height = int(stream.get("width") or 0), int(stream.get("height") or 0)
+    """Legacy entry point delegates to the same bounded spatial compositor."""
     source_duration = video_stream_duration(source_video)
-    if min(width, height) <= 0 or not (0.25 <= segment_duration < source_duration):
+    if not (0.25 <= segment_duration < source_duration):
         raise WorkerError("O trecho confirmado de lip-sync não possui duração ou dimensões seguras.")
-    fps = source_frame_rate(source_video)
-    output = job_dir / "lipsync-segmented.mp4"
-    filter_graph = (
-        f"[0:v]trim=duration={segment_duration:.6f},setpts=PTS-STARTPTS,"
-        f"fps={fps:.6f},scale={width}:{height}:flags=lanczos,setsar=1[face];"
-        f"[1:v]trim=start={segment_duration:.6f}:end={source_duration:.6f},"
-        f"setpts=PTS-STARTPTS,fps={fps:.6f},setsar=1[rest];"
-        "[face][rest]concat=n=2:v=1:a=0[video]"
-    )
-    run([
-        "ffmpeg", "-y", "-i", str(rendered_segment), "-i", str(source_video),
-        "-filter_complex", filter_graph, "-map", "[video]", "-an", "-t", f"{source_duration:.6f}",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart", str(output),
-    ], log=log)
-    assert_video_stream_coverage(output, source_video)
-    return output
+    return compose_face_patch(rendered_segment, source_video, source_video, 0.0, segment_duration, 1,
+                              job_dir, log, face_boxes=face_boxes, box_fps=box_fps, box_size=box_size)
 
 
 def render_confirmed_face_segment(
@@ -1500,6 +1714,7 @@ def render_confirmed_face_segment(
     root = Path(os.environ.get("DUBSTUDIO_MUSETALK_ROOT", "/content/MuseTalk"))
     if not normalized.exists() or not root.exists():
         raise WorkerError("Os arquivos do TalkNet ou MuseTalk necessários para o trecho facial não estão disponíveis.")
+    analysis["musetalk_audio_frame_clock"] = patch_musetalk_audio_frame_clock(root)
     normalized_duration = video_stream_duration(normalized)
     if segment_duration > normalized_duration + 0.15:
         raise WorkerError("O trecho facial excede o vídeo normalizado confirmado pelo TalkNet.")
@@ -1569,7 +1784,10 @@ def render_confirmed_face_segment(
     result = run_streaming(command, cwd=root, log=log, on_output=report_musetalk_progress)
     rendered = select_musetalk_output(result_dir, before, result, "MuseTalk não criou o trecho facial esperado.")
     assert_video_stream_coverage(rendered, segment_video)
-    composed = compose_confirmed_face_segment(rendered, video, segment_duration, job_dir, log)
+    composed = compose_confirmed_face_segment(
+        rendered, video, segment_duration, job_dir, log, face_boxes=coordinates, box_fps=fps,
+        box_size=(int(segment_stream.get("width") or 0), int(segment_stream.get("height") or 0)),
+    )
     source_duration = video_stream_duration(video)
     analysis["coordinate_source"] = "TalkNet S3FD no trecho facial confirmado"
     analysis["musetalk_input"] = {
@@ -1579,11 +1797,388 @@ def render_confirmed_face_segment(
         "coordinate_source": analysis["coordinate_source"],
     }
     analysis["lipsync_confirmed_segments"] = [{"start": 0.0, "end": round(segment_duration, 3)}]
+    analysis["spatial_composition"] = perioral_composition_summary(job_dir, video, 1)
     analysis["preserved_no_speaker_visual_segments"] = ([{
         "start": round(segment_duration, 3), "end": round(source_duration, 3),
         "reason": "TalkNet não confirmou rosto falante; imagem original preservada",
     }] if source_duration - segment_duration > 0.05 else [])
     return composed
+
+
+def spatial_face_boxes(
+    boxes: object,
+    box_fps: float,
+    duration: float,
+    box_size: tuple[int, int],
+    output_size: tuple[int, int],
+) -> list[tuple[int, int, int, int]]:
+    """Validate every box before creating a strictly bounded alpha mask."""
+    try:
+        fps = float(box_fps)
+        source_width, source_height = box_size
+        width, height = output_size
+    except (TypeError, ValueError):
+        raise WorkerError("A máscara facial não possui dimensões válidas.") from None
+    if isinstance(box_fps, bool) or not math.isfinite(fps) or fps != CANONICAL_FACE_FPS:
+        raise WorkerError("A máscara facial exige o contrato canônico de 25 fps.")
+    if (min(source_width, source_height, width, height) <= 0
+            or not isinstance(boxes, (list, tuple)) or not boxes
+            or len(boxes) != int(round(duration * fps))
+            or abs(len(boxes) / fps - duration) > 1e-6):
+        raise WorkerError("A máscara facial não cobre exatamente a janela confirmada.")
+    scaled = []
+    for raw in boxes:
+        if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+            raise WorkerError("A máscara facial contém caixa inválida.")
+        if any(isinstance(value, bool) or not isinstance(value, (int, float))
+               or not math.isfinite(value) or int(value) != value for value in raw):
+            raise WorkerError("A máscara facial contém coordenadas inválidas.")
+        x1, y1, x2, y2 = (int(value) for value in raw)
+        if not (0 <= x1 < x2 <= source_width and 0 <= y1 < y2 <= source_height):
+            raise WorkerError("A máscara facial ultrapassa a imagem rastreada.")
+        mapped = (round(x1 * width / source_width), round(y1 * height / source_height),
+                  round(x2 * width / source_width), round(y2 * height / source_height))
+        if mapped[2] - mapped[0] < 24 or mapped[3] - mapped[1] < 24:
+            raise WorkerError("A máscara facial ficou pequena demais após ajustar a resolução.")
+        scaled.append(mapped)
+    return scaled
+
+
+PERIORAL_MASK_CONTRACT = "perioral-source-dwpose68-inner-feather-v1"
+PERIORAL_MUSE_COMMIT = "0a89dec45a0192b824e3cf4daf96c239440c5ed8"
+
+
+def perioral_landmark_polygon(width: int, height: int, bbox: tuple[int, int, int, int],
+                              points: object) -> tuple[list[tuple[float, float]], float]:
+    """Real 68-point source evidence, never mouth coordinates invented from a box."""
+    if not isinstance(points, (list, tuple)) or len(points) != 68:
+        raise WorkerError("A máscara perioral exige 68 landmarks reais com confiança; composição bloqueada.")
+    x1, y1, x2, y2 = bbox
+    if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
+        raise WorkerError("O track da máscara perioral ultrapassa o quadro original.")
+    values = []
+    required = {8, *range(17, 68)}
+    for index, point in enumerate(points):
+        if (not isinstance(point, (list, tuple)) or len(point) != 3
+                or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                       or not math.isfinite(value) for value in point)):
+            raise WorkerError("A máscara perioral contém landmark inválido.")
+        x, y, confidence = (float(value) for value in point)
+        if not 0 <= confidence <= 1 or (index in required and
+                (confidence < 0.55 or not x1 <= x < x2 or not y1 <= y < y2)):
+            raise WorkerError(f"Landmark facial {index} ausente, fora do track ou incerto; composição perioral bloqueada.")
+        values.append((x, y))
+    left, right = values[48], values[54]
+    mouth_width = math.hypot(right[0] - left[0], right[1] - left[1])
+    if not 10 <= mouth_width <= 0.85 * math.hypot(x2 - x1, y2 - y1):
+        raise WorkerError("Os landmarks não delimitam uma boca perioral segura.")
+    ux, uy = (right[0] - left[0]) / mouth_width, (right[1] - left[1]) / mouth_width
+    vx, vy = -uy, ux
+    center = ((left[0] + right[0]) / 2, (left[1] + right[1]) / 2)
+    if (values[8][0] - center[0]) * vx + (values[8][1] - center[1]) * vy < 0:
+        vx, vy = -vx, -vy
+    def vertical(point):
+        return (point[0] - center[0]) * vx + (point[1] - center[1]) * vy
+    protected = max(vertical(values[index]) for index in [*range(17, 27), *range(36, 48)])
+    # This anatomical half-plane rotates with the mouth/face, not the image axes.
+    upper_limit = max(protected + mouth_width * 0.18, vertical(values[30]) - mouth_width * 0.08)
+    if (vertical(values[30]) >= -mouth_width * 0.12 or vertical(values[8]) <= mouth_width * 0.18
+            or min(vertical(values[index]) for index in range(48, 60)) <= upper_limit + mouth_width * 0.04):
+        raise WorkerError("Boca, nariz e olhos não têm separação anatômica confiável; composição bloqueada.")
+    margin = min(14.0, mouth_width * 0.12)
+    cloud = [(values[index][0] + math.cos(angle * math.pi / 4) * margin,
+              values[index][1] + math.sin(angle * math.pi / 4) * margin)
+             for index in [*range(31, 36), *range(48, 60)] for angle in range(8)]
+    def cross(a, b, c):
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    ordered = sorted(set(cloud))
+    lower, upper = [], []
+    for point in ordered:
+        while len(lower) > 1 and cross(lower[-2], lower[-1], point) <= 0:
+            lower.pop()
+        lower.append(point)
+    for point in reversed(ordered):
+        while len(upper) > 1 and cross(upper[-2], upper[-1], point) <= 0:
+            upper.pop()
+        upper.append(point)
+    polygon = lower[:-1] + upper[:-1]
+    # Intersect with the tracked face and a strict eye/forehead exclusion plane.
+    planes = [(1, 0, -x1), (-1, 0, x2 - 1), (0, 1, -y1), (0, -1, y2 - 1),
+              (vx, vy, -center[0] * vx - center[1] * vy - upper_limit)]
+    for a, b, c in planes:
+        clipped = []
+        for previous, current in zip(polygon[-1:] + polygon[:-1], polygon):
+            before, after = a * previous[0] + b * previous[1] + c, a * current[0] + b * current[1] + c
+            if (before >= 0) != (after >= 0):
+                ratio = before / (before - after)
+                clipped.append((previous[0] + ratio * (current[0] - previous[0]),
+                                previous[1] + ratio * (current[1] - previous[1])))
+            if after >= 0:
+                clipped.append(current)
+        polygon = clipped
+        if len(polygon) < 3:
+            raise WorkerError("A região perioral não cabe no track confirmado.")
+    return polygon, max(2.0, min(8.0, mouth_width * 0.08))
+
+
+def perioral_mask_frame(width: int, height: int, bbox: tuple[int, int, int, int], points: object) -> bytes:
+    """Convex mouth/lower-nose alpha; zero outside, with inward-only feather."""
+    polygon, feather = perioral_landmark_polygon(width, height, bbox, points)
+    edges = []
+    for previous, current in zip(polygon, polygon[1:] + polygon[:1]):
+        dx, dy = current[0] - previous[0], current[1] - previous[1]
+        length = math.hypot(dx, dy)
+        if length > 1e-8:
+            edges.append((-dy / length, dx / length, (dy * previous[0] - dx * previous[1]) / length))
+    frame = bytearray(width * height)
+    first_y, last_y = max(0, math.floor(min(p[1] for p in polygon))), min(height - 1, math.ceil(max(p[1] for p in polygon)))
+    for y in range(first_y, last_y + 1):
+        py = y + 0.5
+        left, right, full_left, full_right = 0.0, float(width - 1), 0.0, float(width - 1)
+        ceiling = 1.0
+        for a, b, c in edges:
+            constant = b * py + c
+            if a > 1e-8:
+                left = max(left, -constant / a - 0.5)
+                full_left = max(full_left, (feather - constant) / a - 0.5)
+            elif a < -1e-8:
+                right = min(right, -constant / a - 0.5)
+                full_right = min(full_right, (feather - constant) / a - 0.5)
+            else:
+                ceiling = min(ceiling, constant / feather)
+        if ceiling <= 0 or left > right:
+            continue
+        start, end = max(0, math.ceil(left)), min(width - 1, math.floor(right))
+        interior_start, interior_end = max(start, math.ceil(full_left)), min(end, math.floor(full_right))
+        if ceiling >= 1 and interior_start <= interior_end:
+            frame[y * width + interior_start:y * width + interior_end + 1] = b'\xff' * (interior_end - interior_start + 1)
+            boundary = [*range(start, interior_start), *range(interior_end + 1, end + 1)]
+        else:
+            boundary = range(start, end + 1)
+        for x in boundary:
+            distance = min(a * (x + 0.5) + b * py + c for a, b, c in edges)
+            frame[y * width + x] = max(0, min(255, int(255 * min(1.0, distance / feather))))
+    if not any(frame):
+        raise WorkerError("A máscara perioral ficou vazia; nenhum rosto inteiro será usado como fallback.")
+    return bytes(frame)
+
+
+def perioral_landmark_binding(reference_video: Path, boxes: list, width: int, height: int,
+                               start_seconds: float) -> dict:
+    if (isinstance(start_seconds, bool) or not isinstance(start_seconds, (int, float))
+            or not math.isfinite(start_seconds)):
+        raise WorkerError("O início dos landmarks periorais deve ser um instante canônico válido.")
+    start_frame = round(start_seconds * CANONICAL_FACE_FPS)
+    if (start_seconds < 0
+            or abs(start_frame / CANONICAL_FACE_FPS - start_seconds) > 1e-6):
+        raise WorkerError("Os landmarks periorais exigem a mesma janela canônica de 25 fps.")
+    return {"contract": PERIORAL_MASK_CONTRACT, "musetalk_commit": PERIORAL_MUSE_COMMIT,
+            "model": "dw-ll_ucoco_384-face-23:91", "source_sha256": sha256(reference_video),
+            "boxes_sha256": hashlib.sha256(json.dumps(boxes, separators=(",", ":"), allow_nan=False).encode()).hexdigest(),
+            "source_size": [width, height], "fps": CANONICAL_FACE_FPS,
+            "start_frame": start_frame, "frame_count": len(boxes)}
+
+
+def validate_perioral_landmarks(payload: object, binding: dict, boxes: list) -> list:
+    if (not isinstance(payload, dict) or any(payload.get(key) != value for key, value in binding.items())
+            or payload.get("device") not in {"cpu", "cuda:0"}
+            or not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("model_sha256", "")))):
+        raise WorkerError("O contrato/cache de landmarks periorais não corresponde à fonte, ao track ou à revisão; prova antiga recusada.")
+    frames = payload.get("frames")
+    if not isinstance(frames, list) or len(frames) != len(boxes):
+        raise WorkerError("Faltam landmarks periorais em quadros confirmados; composição bloqueada.")
+    width, height = binding["source_size"]
+    for index, (frame, box) in enumerate(zip(frames, boxes)):
+        if not isinstance(frame, dict) or frame.get("frame_index") != binding["start_frame"] + index:
+            raise WorkerError("O relógio dos landmarks periorais não corresponde ao track confirmado.")
+        try:
+            perioral_landmark_polygon(width, height, box, frame.get("points"))
+        except WorkerError as error:
+            raise WorkerError(f"Landmarks periorais no quadro {frame['frame_index']} recusados: {error}") from error
+    return frames
+
+
+def generate_perioral_landmarks(reference_video: Path, boxes: list, width: int, height: int,
+                                start_seconds: float, job_dir: Path, log: Path,
+                                device: str | None = None) -> dict:
+    """Load the pinned local DWPose once, inside the isolated MuseTalk runtime."""
+    binding = perioral_landmark_binding(reference_video, boxes, width, height, start_seconds)
+    device = device or os.environ.get("DUBSTUDIO_PERIORAL_DEVICE", "cuda:0")
+    if device not in {"cpu", "cuda:0"}:
+        raise WorkerError("Escolha explicitamente cpu ou cuda:0 para landmarks periorais.")
+    root = Path(os.environ.get("DUBSTUDIO_MUSETALK_ROOT", "/content/MuseTalk"))
+    executable = os.environ.get("DUBSTUDIO_MUSETALK_PYTHON", "")
+    if not executable or not Path(executable).is_file() or not root.is_dir():
+        raise WorkerError("Runtime MuseTalk de landmarks ausente; configure o Python isolado, sem fallback para caixa facial.")
+    head = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=30)
+    if head.returncode or head.stdout.strip() != PERIORAL_MUSE_COMMIT:
+        raise WorkerError("Os landmarks periorais exigem a revisão MuseTalk fixada.")
+    checkpoint = root / "models/dwpose/dw-ll_ucoco_384.pth"
+    config = root / "musetalk/utils/dwpose/rtmpose-l_8xb32-270e_coco-ubody-wholebody-384x288.py"
+    if not checkpoint.is_file() or not config.is_file():
+        raise WorkerError("Modelo/configuração DWPose local ausente; landmarks não serão inventados.")
+    model_sha = sha256(checkpoint)
+    identity = hashlib.sha256(json.dumps({**binding, "model_sha256": model_sha}, sort_keys=True).encode()).hexdigest()
+    target = job_dir / f"perioral-landmarks-{identity}.json"
+    if target.is_file():
+        try:
+            payload = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise WorkerError("O cache de landmarks periorais está ilegível; composição bloqueada.") from error
+        validate_perioral_landmarks(payload, binding, boxes)
+        if payload["model_sha256"] != model_sha:
+            raise WorkerError("Os pesos dos landmarks diferem do cache perioral.")
+        return payload
+    request = job_dir / f".perioral-request-{time.time_ns()}.json"
+    staged = job_dir / f".perioral-landmarks-{time.time_ns()}.json"
+    write_json(request, {**binding, "boxes": boxes, "source": str(reference_video.resolve()),
+                         "model_sha256": model_sha, "device": device})
+    script = r'''
+import os, sys, json, hashlib, subprocess
+from pathlib import Path
+import numpy as np
+import cv2, torch, mmpose
+from mmpose.apis import init_model, inference_topdown
+request = json.loads(Path(sys.argv[1]).read_text())
+if mmpose.__version__ != "1.1.0":
+    raise RuntimeError("Versão mmpose inesperada; landmarks recusados")
+device = request["device"]
+if device == "cuda:0" and not torch.cuda.is_available():
+    raise RuntimeError("GPU de landmarks solicitada indisponível; não haverá fallback CPU")
+torch.set_num_threads(min(4, max(1, os.cpu_count() or 1)))
+model = init_model("./musetalk/utils/dwpose/rtmpose-l_8xb32-270e_coco-ubody-wholebody-384x288.py",
+                   "./models/dwpose/dw-ll_ucoco_384.pth", device=device)
+width, height = request["source_size"]
+start, count = request["start_frame"], request["frame_count"]
+clock = f"setpts=PTS-STARTPTS,fps=25:start_time=0,trim=start_frame={start}:end_frame={start+count},setpts=PTS-STARTPTS"
+command = ["ffmpeg", "-nostdin", "-v", "error", "-i", request["source"], "-vf", clock,
+           "-map", "0:v:0", "-an", "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"]
+process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+frames = []
+try:
+    for offset, box in enumerate(request["boxes"]):
+        needed, chunks = width*height*3, []
+        while needed:
+            chunk = process.stdout.read(needed)
+            if not chunk: raise RuntimeError(f"Fonte sem quadro perioral {start+offset}")
+            chunks.append(chunk); needed -= len(chunk)
+        frame = np.frombuffer(b"".join(chunks), np.uint8).reshape(height, width, 3)
+        x1,y1,x2,y2 = box
+        crop = frame[y1:y2,x1:x2].copy()
+        predictions = inference_topdown(model, crop,
+            bboxes=np.array([[0,0,x2-x1,y2-y1]], dtype=np.float32), bbox_format="xyxy")
+        if len(predictions) != 1: raise RuntimeError("Não há um único rosto no track perioral")
+        instances = predictions[0].pred_instances
+        points, scores = instances.keypoints, instances.keypoint_scores
+        if points.shape != (1,133,2) or scores.shape != (1,133):
+            raise RuntimeError("DWPose não produziu o contrato facial 133/68 com confiança")
+        face = points[0,23:91]
+        confidence = scores[0,23:91]
+        frames.append({"frame_index":start+offset,"points":[[float(p[0]+x1),float(p[1]+y1),float(s)] for p,s in zip(face,confidence)]})
+        if offset%25 == 0: print(f"Landmarks periorais {offset+1}/{count} ({device})", flush=True)
+    if process.stdout.read(1): raise RuntimeError("Fonte possui quadros extras no contrato perioral")
+    if process.wait(timeout=30): raise RuntimeError(process.stderr.read().decode(errors="replace")[-1500:])
+finally:
+    if process.poll() is None: process.kill(); process.wait()
+payload = {key:value for key,value in request.items() if key not in {"source","boxes"}}
+payload["frames"] = frames
+Path(sys.argv[2]).write_text(json.dumps(payload,allow_nan=False), encoding="utf-8")
+'''
+    environment = dict(os.environ)
+    environment.update(MPLBACKEND="Agg", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
+    if device == "cpu":
+        environment["CUDA_VISIBLE_DEVICES"] = ""
+    try:
+        result = subprocess.run([executable, "-c", script, str(request), str(staged)], cwd=root,
+                                env=environment, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                timeout=max(180, min(7200, len(boxes) * 3)))
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n$ perioral landmarks ({device})\n{result.stdout}\n{result.stderr}\n")
+        if result.returncode or not staged.is_file():
+            raise WorkerError(f"Landmarks periorais falharam; composição bloqueada: {(result.stderr or result.stdout)[-1600:]}")
+        try:
+            payload = json.loads(staged.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise WorkerError("A inferência não produziu landmarks periorais legíveis; composição bloqueada.") from error
+        validate_perioral_landmarks(payload, binding, boxes)
+        if (payload["model_sha256"] != model_sha or sha256(reference_video) != binding["source_sha256"]
+                or sha256(checkpoint) != model_sha):
+            raise WorkerError("Fonte ou pesos mudaram durante os landmarks periorais; cache recusado.")
+        staged.replace(target)
+        return payload
+    except subprocess.TimeoutExpired as error:
+        raise WorkerError("Tempo de landmarks periorais excedido; nenhum rosto inteiro será usado.") from error
+    finally:
+        request.unlink(missing_ok=True)
+        staged.unlink(missing_ok=True)
+
+
+def spatial_face_mask_frame(width: int, height: int, bbox: tuple[int, int, int, int]) -> bytes:
+    """Zero outside the tracked box; feathering never expands beyond it."""
+    x1, y1, x2, y2 = bbox
+    if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
+        raise WorkerError("A máscara facial ultrapassa o quadro original.")
+    box_width, box_height = x2 - x1, y2 - y1
+    feather = max(2, min(12, min(box_width, box_height) // 10))
+    horizontal = [min(255, 255 * min(x, box_width - 1 - x) // feather) for x in range(box_width)]
+    rows: dict[int, bytes] = {}
+    frame = bytearray(width * height)
+    for y in range(box_height):
+        opacity = min(255, 255 * min(y, box_height - 1 - y) // feather)
+        if opacity not in rows:
+            rows[opacity] = bytes(min(value, opacity) for value in horizontal)
+        row = rows[opacity]
+        offset = (y1 + y) * width + x1
+        frame[offset:offset + box_width] = row
+    return bytes(frame)
+
+
+def write_spatial_face_mask(path: Path, boxes: list[tuple[int, int, int, int]],
+                            width: int, height: int, fps: float, log: Path,
+                            reference_video: Path | None = None, start_seconds: float = 0.0,
+                            landmark_payload: dict | None = None) -> None:
+    # Matroska's millisecond timestamps are exact for 25-fps/40-ms samples.
+    # Other rates can desynchronize alphamerge even when boxes/render agree;
+    # refuse those contracts instead of relabelling/resampling facial proof.
+    try:
+        canonical_rate = not isinstance(fps, bool) and float(fps) == CANONICAL_FACE_FPS
+    except (TypeError, ValueError, OverflowError):
+        canonical_rate = False
+    if not canonical_rate:
+        raise WorkerError("A máscara facial exige o contrato canônico de 25 fps.")
+    if reference_video is None:
+        raise WorkerError("A máscara perioral exige vídeo original e landmarks; máscara de rosto inteiro bloqueada.")
+    binding = perioral_landmark_binding(reference_video, boxes, width, height, start_seconds)
+    payload = landmark_payload if landmark_payload is not None else generate_perioral_landmarks(
+        reference_video, boxes, width, height, start_seconds, path.parent, log)
+    frames = validate_perioral_landmarks(payload, binding, boxes)
+    command = ["ffmpeg", "-y", "-nostdin", "-hide_banner", "-v", "error",
+               "-f", "rawvideo", "-pixel_format", "gray", "-video_size", f"{width}x{height}",
+               "-framerate", str(CANONICAL_FACE_FPS), "-i", "pipe:0", "-an", "-c:v", "ffv1",
+               "-level", "3", "-pix_fmt", "gray", str(path)]
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write("\n$ perioral alpha mask: real source landmarks, eyes/forehead zero, inward feather\n")
+        handle.flush()
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=handle)
+        try:
+            assert process.stdin is not None
+            for bbox, frame in zip(boxes, frames):
+                process.stdin.write(perioral_mask_frame(width, height, bbox, frame["points"]))
+            process.stdin.close()
+            code = process.wait(timeout=120)
+        except (OSError, subprocess.TimeoutExpired, WorkerError) as error:
+            process.kill()
+            process.wait()
+            if isinstance(error, WorkerError):
+                raise
+            raise WorkerError("Não foi possível criar a máscara facial segura.") from None
+    if code or not path.is_file() or path.stat().st_size <= 0:
+        raise WorkerError("A criação da máscara facial falhou; nenhuma composição foi liberada.")
+    write_json(path.with_suffix(".perioral.json"), {**binding, "mask_sha256": sha256(path),
+               "landmarks_sha256": hashlib.sha256(json.dumps(payload, sort_keys=True, allow_nan=False).encode()).hexdigest(),
+               "device": payload["device"], "model_sha256": payload["model_sha256"],
+               "eyes_forehead_alpha": 0, "feather": "inward-only", "composition_completed": False,
+               "human_visual_review": "pending"})
 
 
 def compose_face_patch(
@@ -1595,16 +2190,51 @@ def compose_face_patch(
     index: int,
     job_dir: Path,
     log: Path,
+    face_boxes: object = None,
+    box_fps: float = 0.0,
+    box_size: tuple[int, int] | None = None,
+    landmark_payload: dict | None = None,
+    display_window: tuple[float, float] | None = None,
 ) -> Path:
-    """Insere uma janela MuseTalk sem alterar as demais cenas do vídeo."""
+    """Aplica uma janela MuseTalk sobre o relógio completo do vídeo original.
+
+    Recortar, converter cada parte para FPS e concatenar perde quadros quando
+    os limites de 25 fps do TalkNet não coincidem com os quadros do original.
+    O overlay conserva os PTS/quadros do vídeo-base, inclusive em fontes VFR;
+    somente pixels periorais guiados por landmarks e quadros em [início, fim) recebem
+    a imagem renderizada. O resto vem do vídeo-base no PTS original, não do
+    quadro normalizado a 25 fps que o MuseTalk devolveu.
+    """
     # The reference remains the original video even after preceding patches.
     # A normalized AVI or an accumulated composition cannot extend its timeline.
     source_duration = video_stream_duration(reference_video)
     base_duration = video_stream_duration(base_video)
     end_seconds = start_seconds + segment_duration
+    display_start, display_end = start_seconds, end_seconds
+    if display_window is not None:
+        if (not isinstance(display_window, tuple) or len(display_window) != 2
+                or any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+                       for value in display_window)):
+            raise WorkerError("A janela nativa da pessoa não possui limites válidos.")
+        display_start, display_end = display_window
+        if (display_start < start_seconds - 1e-6 or display_end > end_seconds + 1e-6
+                or display_end <= display_start):
+            raise WorkerError("A composição tentou cruzar o turno nativo da pessoa correta.")
     reference_meta = ffprobe(reference_video)
     stream = next((item for item in reference_meta["streams"] if item.get("codec_type") == "video"), {})
     width, height = int(stream.get("width") or 0), int(stream.get("height") or 0)
+    display_frame_window = None
+    if display_window is not None:
+        try:
+            native_rate = Fraction(str(stream.get("avg_frame_rate") or stream.get("r_frame_rate")))
+            if not 1 <= native_rate <= 120:
+                raise ValueError("rate")
+        except (ValueError, TypeError, ZeroDivisionError) as error:
+            raise WorkerError("A composição nativa precisa da taxa real dos quadros montados.") from error
+        display_frame_window = (math.ceil(display_start * float(native_rate) - 1e-7),
+                                math.ceil(display_end * float(native_rate) - 1e-7))
+        if display_frame_window[1] <= display_frame_window[0]:
+            raise WorkerError("A janela nativa não cobre um quadro completo da pessoa correta.")
     if (
         min(width, height) <= 0 or not math.isfinite(source_duration) or source_duration <= 0
         or not math.isfinite(base_duration) or abs(base_duration - source_duration) > 0.05
@@ -1612,40 +2242,190 @@ def compose_face_patch(
         or start_seconds < 0 or segment_duration <= 0 or end_seconds > source_duration + 1e-6
     ):
         raise WorkerError("A janela facial confirmada não cabe com segurança no vídeo original.")
-    fps = source_frame_rate(reference_video)
-    filters = []
-    labels = []
-    if start_seconds > 1e-6:
-        filters.append(
-            f"[1:v]trim=start=0:end={start_seconds:.6f},setpts=PTS-STARTPTS,"
-            f"fps={fps:.6f},setsar=1[before]"
+    rendered_duration = video_stream_duration(rendered_segment)
+    expected_frames = video_frame_count(reference_video)
+    if (
+        not math.isfinite(rendered_duration) or rendered_duration < segment_duration - 1e-6
+        or expected_frames <= 0 or video_frame_count(base_video) != expected_frames
+    ):
+        raise WorkerError("O trecho facial ou vídeo-base perdeu quadros; composição bloqueada.")
+    if box_size is None:
+        raise WorkerError("A composição exige caixas faciais rastreadas; overlay completo foi bloqueado.")
+    scaled_boxes = spatial_face_boxes(face_boxes, box_fps, segment_duration, box_size, (width, height))
+    rendered_meta = ffprobe(rendered_segment)
+    rendered_stream = next((item for item in rendered_meta["streams"] if item.get("codec_type") == "video"), {})
+    try:
+        rates = [Fraction(str(rendered_stream.get(key))) for key in ("r_frame_rate", "avg_frame_rate")]
+    except (ValueError, ZeroDivisionError):
+        rates = []
+    rendered_frames = video_frame_count(rendered_segment)
+    if (
+        len(rates) != 2 or any(rate != CANONICAL_FACE_FPS for rate in rates)
+        or rendered_frames < len(scaled_boxes)
+        or abs(rendered_frames / CANONICAL_FACE_FPS - rendered_duration) > 1e-6
+    ):
+        raise WorkerError(
+            "O render facial não corresponde às caixas, à duração e ao contrato canônico de 25 fps; composição bloqueada."
         )
-        labels.append("[before]")
-    filters.append(
-        f"[0:v]trim=duration={segment_duration:.6f},setpts=PTS-STARTPTS,"
-        f"fps={fps:.6f},scale={width}:{height}:flags=lanczos,setsar=1[face]"
-    )
-    labels.append("[face]")
-    if end_seconds < source_duration - 1e-6:
-        filters.append(
-            f"[1:v]trim=start={end_seconds:.6f}:end={source_duration:.6f},setpts=PTS-STARTPTS,"
-            f"fps={fps:.6f},setsar=1[after]"
-        )
-        labels.append("[after]")
-    if len(labels) > 1:
-        filters.append(f"{''.join(labels)}concat=n={len(labels)}:v=1:a=0[video]")
-        mapped = "[video]"
-    else:
-        mapped = labels[0]
-    output = job_dir / f"lipsync-segmented-{index:02d}.mp4"
+    # MuseTalk can pad its own tail. Canonical extra samples are harmless:
+    # trim removes them before alphamerge, and overlay's end stays exclusive.
+    # Never extend a short render or relabel/resample an incompatible rate.
+    mask = job_dir / f"musetalk-perioral-source-mask-v1-{index:02d}.mkv"
+    write_spatial_face_mask(mask, scaled_boxes, width, height, box_fps, log,
+                            reference_video=reference_video, start_seconds=start_seconds,
+                            landmark_payload=landmark_payload)
+    proof_path = mask.with_suffix(".perioral.json")
+    try:
+        proof = json.loads(proof_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise WorkerError("Falta a prova atual da máscara perioral; composição bloqueada.") from error
+    binding = perioral_landmark_binding(reference_video, scaled_boxes, width, height, start_seconds)
+    if (not isinstance(proof, dict) or any(proof.get(key) != value for key, value in binding.items())
+            or proof.get("mask_sha256") != sha256(mask) or proof.get("eyes_forehead_alpha") != 0
+            or proof.get("feather") != "inward-only" or proof.get("human_visual_review") != "pending"
+            or proof.get("composition_completed") is not False):
+        raise WorkerError("A prova perioral não corresponde à máscara atual; composição bloqueada.")
+    enable = (f"gte(n,{display_frame_window[0]})*lt(n,{display_frame_window[1]})" if display_frame_window is not None
+              else f"gte(t,{display_start:.9f})*lt(t,{display_end:.9f})")
+    filters = [
+        "[1:v]setpts=PTS-STARTPTS,setsar=1[base]",
+        f"[0:v]trim=duration={segment_duration:.6f},"
+        "setpts=PTS-STARTPTS,"
+        f"scale={width}:{height}:flags=lanczos,setsar=1[face]",
+        f"[2:v]trim=duration={segment_duration:.6f},setpts=PTS-STARTPTS,setsar=1[mask]",
+        f"[face][mask]alphamerge,setpts=PTS-STARTPTS+{start_seconds:.6f}/TB[patch]",
+        # Keep the final 25 fps sample through its own display interval. The
+        # explicit exclusive end prevents repeating it outside confirmed time.
+        "[base][patch]overlay=eof_action=repeat:repeatlast=1:"
+        f"enable='{enable}'[video]",
+    ]
+    output = job_dir / f"lipsync-segmented-perioral-v1-{index:02d}.mp4"
     run([
-        "ffmpeg", "-y", "-i", str(rendered_segment), "-i", str(base_video),
-        "-filter_complex", ";".join(filters), "-map", mapped, "-an", "-t", f"{source_duration:.6f}",
+        "ffmpeg", "-y", "-i", str(rendered_segment), "-i", str(base_video), "-i", str(mask),
+        "-filter_complex", ";".join(filters), "-map", "[video]", "-an", "-t", f"{source_duration:.6f}",
+        "-vsync", "0",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
         "-movflags", "+faststart", str(output),
     ], log=log)
+    if video_frame_count(output) != expected_frames:
+        raise WorkerError("A composição alterou a contagem de quadros do vídeo original; resultado bloqueado.")
     assert_video_stream_coverage(output, reference_video)
+    if sha256(reference_video) != binding["source_sha256"] or sha256(mask) != proof["mask_sha256"]:
+        raise WorkerError("Fonte ou máscara mudaram durante a composição perioral; resultado bloqueado.")
+    proof.update(render_sha256=sha256(rendered_segment), output_sha256=sha256(output),
+                 composition_completed=True, output_frame_count=expected_frames)
+    if display_window is not None:
+        proof.update(display_window={"start": display_start, "end": display_end},
+                     display_window_policy="audio-master-native-person-clamp-v1",
+                     display_frame_window={"start_frame": display_frame_window[0],
+                                           "end_frame": display_frame_window[1], "fps": float(native_rate)})
+    write_json(proof_path, proof)
     return output
+
+
+def audio_master_native_display(raw_segment: dict, analysis: dict) -> tuple[tuple[float, float], dict]:
+    """Clamp canonical patches to actual native frames of the correct person."""
+    from dubstudio_audio_master import validate_timeline
+    timeline = validate_timeline(analysis["timeline"])
+    native_fps = Fraction(timeline["video_base"]["fps_num"], timeline["video_base"]["fps_den"])
+    mappings = [item for item in timeline["visual_mapping"]
+                if item["source_segment_id"] == raw_segment.get("source_segment_id")
+                and item["speaker"] == raw_segment.get("speaker")]
+    if len(mappings) != 1:
+        raise WorkerError("A inferência facial não corresponde a um turno único da pessoa.")
+    mapping = mappings[0]
+    canonical_fps = Fraction(str(raw_segment["fps"]))
+    left = max(Fraction(raw_segment["start_frame"], 1) / canonical_fps,
+               Fraction(mapping["output_start_frame"], 1) / native_fps)
+    right = min(Fraction(raw_segment["end_frame"], 1) / canonical_fps,
+                Fraction(mapping["output_end_frame"], 1) / native_fps)
+    first = max(mapping["output_start_frame"], math.ceil(left * native_fps))
+    last = min(mapping["output_end_frame"], math.ceil(right * native_fps))
+    if right <= left or last <= first:
+        raise WorkerError("O trecho de inferência não cobre nenhum quadro nativo seguro da pessoa.")
+    source_group = next((item for item in analysis.get("mapped_source_segments", [])
+                         if item.get("source_segment_id") == mapping["source_segment_id"]
+                         and item.get("speaker") == mapping["speaker"]), None)
+    if source_group is None or source_group["start_frame"] > first or source_group["end_frame"] < last:
+        raise WorkerError("A prova de rosto não cobre os quadros nativos realmente compostos.")
+    proof = {**{key: raw_segment.get(key) for key in ("source_segment_id", "speaker", "track_id",
+               "face_confirmation", "speaker_confirmation", "coordinate_source")},
+             "start_frame": first, "end_frame": last, "fps": float(native_fps),
+             "boxes": source_group["boxes"][first - source_group["start_frame"]:last - source_group["start_frame"]],
+             "canonical_inference_window": {"start_frame": raw_segment["start_frame"],
+                                            "end_frame": raw_segment["end_frame"], "fps": float(canonical_fps)},
+             "display_window": {"start": float(left), "end": float(right)}}
+    return (float(left), float(right)), proof
+
+
+def audio_master_boundary_preservation(analysis: dict, confirmed: list[dict]) -> list[dict]:
+    """Report only unpatched native edge samples, never invent speaker scores."""
+    timeline = analysis["timeline"]
+    fps = Fraction(timeline["video_base"]["fps_num"], timeline["video_base"]["fps_den"])
+    maximum = max(float(1 / fps), 1 / CANONICAL_FACE_FPS)
+    records = []
+    for mapping in timeline["visual_mapping"]:
+        if mapping.get("face_confirmation") == "no_face_confirmed":
+            records.append({"start": float(Fraction(mapping["output_start_frame"], 1) / fps),
+                            "end": float(Fraction(mapping["output_end_frame"], 1) / fps),
+                            "reason": "narração sem rosto explicitamente confirmada", "kind": "confirmed_faceless_narration",
+                            "source_segment_id": mapping["source_segment_id"], "speaker": mapping["speaker"]})
+            continue
+        groups = sorted([item for item in confirmed if item.get("source_segment_id") == mapping["source_segment_id"]
+                         and item.get("speaker") == mapping["speaker"]], key=lambda item: item["start_frame"])
+        cursor = mapping["output_start_frame"]
+        gaps = []
+        for item in groups:
+            if item["start_frame"] > cursor:
+                gaps.append((cursor, item["start_frame"]))
+            cursor = max(cursor, item["end_frame"])
+        if cursor < mapping["output_end_frame"]:
+            gaps.append((cursor, mapping["output_end_frame"]))
+        for start, end in gaps:
+            duration = float(Fraction(end - start, 1) / fps)
+            if (duration > maximum + 1e-7
+                    or (start != mapping["output_start_frame"] and end != mapping["output_end_frame"])):
+                raise WorkerError("A inferência deixou uma lacuna interna ou longa no turno da pessoa; lip-sync bloqueado.")
+            records.append({"start": float(Fraction(start, 1) / fps), "end": float(Fraction(end, 1) / fps),
+                            "reason": "Fronteira canônica sem inferência; quadro original da pessoa preservado, sem score positivo",
+                            "kind": "canonical_neutral_boundary", "policy": "audio-master-native-boundary-preservation-v1",
+                            "source_segment_id": mapping["source_segment_id"], "speaker": mapping["speaker"],
+                            "maximum_seconds": maximum, "machine_confirmed": False})
+    return records
+
+
+def perioral_composition_summary(job_dir: Path, source: Path, count: int) -> dict:
+    """A new report must come from completed perioral masks, not a legacy claim."""
+    if type(count) is not int or not 1 <= count <= 30000:
+        raise WorkerError("A composição perioral não possui número de janelas válido.")
+    records = []
+    source_hash = sha256(source)
+    for index in range(1, count + 1):
+        mask = job_dir / f"musetalk-perioral-source-mask-v1-{index:02d}.mkv"
+        output = job_dir / f"lipsync-segmented-perioral-v1-{index:02d}.mp4"
+        try:
+            proof = json.loads(mask.with_suffix('.perioral.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError) as error:
+            raise WorkerError("Falta prova física da composição perioral; relatório bloqueado.") from error
+        if (not isinstance(proof, dict) or proof.get('contract') != PERIORAL_MASK_CONTRACT
+                or proof.get('source_sha256') != source_hash
+                or proof.get('composition_completed') is not True
+                or proof.get('eyes_forehead_alpha') != 0 or type(proof.get('eyes_forehead_alpha')) is not int
+                or proof.get('feather') != 'inward-only' or proof.get('human_visual_review') != 'pending'
+                or type(proof.get('frame_count')) is not int or proof['frame_count'] <= 0
+                or not mask.is_file() or proof.get('mask_sha256') != sha256(mask)
+                or not output.is_file() or proof.get('output_sha256') != sha256(output)
+                or any(not re.fullmatch(r'[0-9a-f]{64}', str(proof.get(key, '')))
+                       for key in ('model_sha256', 'landmarks_sha256'))):
+            raise WorkerError("A prova física perioral não confere; relatório bloqueado.")
+        records.append({'index': index, 'frame_count': proof['frame_count'],
+                        **{key: proof[key] for key in ('source_sha256', 'mask_sha256', 'output_sha256',
+                                                     'model_sha256', 'landmarks_sha256')}})
+    return {'policy': PERIORAL_MASK_CONTRACT, 'outside_face_source': 'original-frame-clock',
+            'mask_outside_tracked_box': 0, 'mask_expands_box': False, 'segments': count,
+            'region': 'mouth-and-lower-nose', 'source_landmarks': 'dwpose68-pinned',
+            'eyes_forehead_alpha': 0, 'human_visual_review': 'pending', 'evidence': records,
+            'encoding_note': 'H.264 lossy encoding may alter decoded pixels; generated content is spatially confined.'}
 
 
 def render_confirmed_talknet_segments(
@@ -1662,11 +2442,17 @@ def render_confirmed_talknet_segments(
         raise WorkerError("TalkNet não forneceu trechos faciais confirmados para sincronizar.")
     if analysis.get("ambiguity") or analysis.get("ambiguous_intervals"):
         raise WorkerError("A análise facial contém ambiguidades; nenhuma janela será omitida para renderizar.")
-    talknet_root = Path(os.environ.get("DUBSTUDIO_TALKNET_ROOT", "/content/TalkNet-ASD"))
-    normalized = talknet_root / "demo" / video.stem / "pyavi" / "video.avi"
+    mapped_clock = analysis.get("timing_mode") == "audio_master"
+    if mapped_clock:
+        validate_audio_master_visual_binding(video, analysis)
+        normalized = Path(analysis["normalized_video"])
+    else:
+        talknet_root = Path(os.environ.get("DUBSTUDIO_TALKNET_ROOT", "/content/TalkNet-ASD"))
+        normalized = talknet_root / "demo" / video.stem / "pyavi" / "video.avi"
     root = Path(os.environ.get("DUBSTUDIO_MUSETALK_ROOT", "/content/MuseTalk"))
     if not normalized.exists() or not root.exists():
         raise WorkerError("Os arquivos do TalkNet ou MuseTalk necessários para os trechos faciais não estão disponíveis.")
+    analysis["musetalk_audio_frame_clock"] = patch_musetalk_audio_frame_clock(root)
     required_weights = [
         root / "models/musetalkV15/musetalk.json", root / "models/musetalkV15/unet.pth",
         root / "models/sd-vae/config.json", root / "models/sd-vae/diffusion_pytorch_model.bin",
@@ -1680,12 +2466,19 @@ def render_confirmed_talknet_segments(
     normalized_stream = next((item for item in normalized_meta["streams"] if item.get("codec_type") == "video"), {})
     normalized_duration = video_stream_duration(normalized)
     source_duration = video_stream_duration(video)
-    bounded_segments, timeline = bound_confirmed_talknet_segments(raw_segments, source_duration, normalized_duration)
+    # A mapped turn can be shorter than the original detected donor: identity
+    # was already proved on the source and the natural audio must not be
+    # lengthened merely to meet the detector's source-window minimum.
+    minimum_frames = 1 if mapped_clock else 20
+    bounded_segments, timeline = bound_confirmed_talknet_segments(
+        raw_segments, source_duration, normalized_duration, minimum_frames=minimum_frames)
     base_video = video
     confirmed_segments = []
+    native_proofs = []
     total = len(bounded_segments)
     os.environ["MPLBACKEND"] = "Agg"
     for index, raw_segment in enumerate(bounded_segments, start=1):
+        segment_minimum = confirmed_face_minimum_frames(raw_segment, minimum_frames)
         try:
             start_frame = int(raw_segment.get("start_frame", -1))
             end_frame = int(raw_segment.get("end_frame", -1))
@@ -1693,7 +2486,7 @@ def render_confirmed_talknet_segments(
             boxes = [tuple(int(value) for value in box) for box in raw_segment.get("boxes", [])]
         except (AttributeError, TypeError, ValueError):
             raise WorkerError(f"O trecho facial {index} não possui coordenadas válidas.") from None
-        if start_frame < 0 or fps <= 0 or len(boxes) != end_frame - start_frame or len(boxes) < 20:
+        if start_frame < 0 or fps <= 0 or len(boxes) != end_frame - start_frame or len(boxes) < segment_minimum:
             raise WorkerError(f"O trecho facial {index} não cobre uma janela segura.")
         start_seconds = start_frame / fps
         segment_duration = len(boxes) / fps
@@ -1740,8 +2533,20 @@ def render_confirmed_talknet_segments(
         result = run_streaming(command, cwd=root, log=log)
         rendered = select_musetalk_output(result_dir, before, result, f"MuseTalk não criou o trecho facial {index}.")
         assert_video_stream_coverage(rendered, segment_video)
-        base_video = compose_face_patch(rendered, base_video, video, start_seconds, segment_duration, index, job_dir, log)
-        confirmed_segments.append({"start": start_seconds, "end": raw_segment["end_frame"] / fps})
+        composition_options = {}
+        if mapped_clock:
+            display, native_proof = audio_master_native_display(raw_segment, analysis)
+            composition_options["display_window"] = display
+            native_proofs.append(native_proof)
+        base_video = compose_face_patch(
+            rendered, base_video, video, start_seconds, segment_duration, index, job_dir, log,
+            face_boxes=coordinates, box_fps=fps,
+            box_size=(int(segment_stream.get("width") or 0), int(segment_stream.get("height") or 0)),
+            **composition_options,
+        )
+        confirmed_segments.append({"start": native_proof["start_frame"] / native_proof["fps"],
+                                   "end": native_proof["end_frame"] / native_proof["fps"]}
+                                  if mapped_clock else {"start": start_seconds, "end": raw_segment["end_frame"] / fps})
     preserved = []
     cursor = 0.0
     for segment in confirmed_segments:
@@ -1750,16 +2555,59 @@ def render_confirmed_talknet_segments(
         cursor = segment["end"]
     if source_duration - cursor > 1e-6:
         preserved.append({"start": cursor, "end": source_duration, "reason": "TalkNet não confirmou rosto falante; imagem original preservada"})
+    if mapped_clock:
+        preserved = audio_master_boundary_preservation(analysis, native_proofs)
     analysis["coordinate_source"] = "TalkNet completo em trechos faciais confirmados"
     # runner_v2 derives its exported proof directly from these frame indices.
     # They must describe exactly the same bounded boxes used by MuseTalk.
-    analysis["confirmed_face_segments"] = bounded_segments
+    analysis["confirmed_face_segments"] = native_proofs if mapped_clock else bounded_segments
     analysis["source_timeline"] = timeline
+    spatial = perioral_composition_summary(job_dir, video, len(confirmed_segments))
+    if mapped_clock:
+        spatial.update(policy="perioral-mapped-source-dwpose68-inner-feather-v1",
+                       outside_face_source="mapped-source-frame-clock",
+                       source_video_sha256=analysis["source_video_sha256"],
+                       timeline_sha256=analysis["timeline_sha256"],
+                       output_base_sha256=analysis["output_base_sha256"],
+                       audio_master_sha256=analysis["audio_master_sha256"])
+        for record, native_proof in zip(spatial["evidence"], native_proofs):
+            record.update(inference_frame_count=record["frame_count"],
+                          frame_count=native_proof["end_frame"] - native_proof["start_frame"],
+                          native_start_frame=native_proof["start_frame"], native_end_frame=native_proof["end_frame"],
+                          native_fps=native_proof["fps"])
+    analysis["spatial_composition"] = spatial
     analysis["lipsync_confirmed_segments"] = confirmed_segments
     analysis["preserved_no_speaker_visual_segments"] = preserved
     analysis["musetalk_input"] = {"video": "trechos TalkNet", "audio": "trechos do mix", "coordinate_source": analysis["coordinate_source"]}
     assert_video_stream_coverage(base_video, video)
     return base_video
+
+
+def validate_audio_master_visual_binding(video: Path, analysis: dict) -> dict:
+    """Bind inferred boxes to the retimed base and actual portable timeline."""
+    from dubstudio_audio_master import AudioMasterError, validate_timeline
+    try:
+        timeline = validate_timeline(analysis.get("timeline"))
+    except AudioMasterError as error:
+        raise WorkerError(f"Montagem de áudio natural recusada: {error}") from error
+    timeline_path = Path(str(analysis.get("timeline_path") or ""))
+    normalized = Path(str(analysis.get("normalized_video") or ""))
+    if (not timeline_path.is_file() or sha256(timeline_path) != analysis.get("timeline_sha256")
+            or not normalized.is_file() or sha256(normalized) != analysis.get("normalized_video_sha256")
+            or sha256(video) != analysis.get("output_base_sha256")
+            or analysis.get("output_base_sha256") != timeline["video_base"].get("sha256")
+            or analysis.get("source_video_sha256") != timeline.get("source_video_sha256")
+            or analysis.get("audio_master_sha256") != timeline.get("audio_master", {}).get("sha256")):
+        raise WorkerError("Fonte, áudio, vídeo montado ou relógio de lip-sync mudou; prova mapeada recusada.")
+    try:
+        on_disk = json.loads(timeline_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise WorkerError("A linha de montagem está ilegível.") from error
+    if on_disk != timeline or video_frame_count(video) != timeline["video_base"]["frame_count"]:
+        raise WorkerError("A linha de montagem não corresponde aos quadros efetivamente renderizados.")
+    if not analysis.get("mapped_normalization") or analysis["mapped_normalization"].get("policy") != "retimed-frame-center-fps25-v1":
+        raise WorkerError("Falta o mapa canônico do vídeo montado para o MuseTalk.")
+    return timeline
 
 
 def musetalk(
@@ -1798,6 +2646,7 @@ def musetalk(
     root = Path(os.environ.get("DUBSTUDIO_MUSETALK_ROOT", "/content/MuseTalk"))
     if not root.exists():
         raise WorkerError("MuseTalk não foi instalado no runtime.")
+    analysis["musetalk_audio_frame_clock"] = patch_musetalk_audio_frame_clock(root)
     required_weights = [
         root / "models/musetalkV15/musetalk.json",
         root / "models/musetalkV15/unet.pth",
@@ -1988,7 +2837,30 @@ def musetalk(
     return rendered, skipped
 
 
-def finalize(video: Path, mix: Path, source: Path, job_dir: Path, duration: float, log: Path) -> Path:
+def finalize(video: Path, mix: Path, source: Path, job_dir: Path, duration: float, log: Path,
+             timing_mode: str = "source", timeline: dict | None = None) -> Path:
+    master_mode = timing_mode == "audio_master"
+    if master_mode:
+        from dubstudio_audio_master import AudioMasterError, validate_timeline
+        try:
+            validated = validate_timeline(timeline)
+        except AudioMasterError as error:
+            raise WorkerError(f"Exportação do áudio natural bloqueada: {error}") from error
+        expected = validated["sample_count"] / validated["sample_rate"]
+        if (abs(duration - expected) > 1 / validated["sample_rate"]
+                or sha256(source) != validated.get("source_video_sha256")
+                or video_frame_count(video) != validated["video_base"]["frame_count"]):
+            raise WorkerError("A exportação diverge do relógio do áudio natural ou perdeu quadros.")
+        # Physical PCM is checked before encoding. No guessed container
+        # duration or -t can hide a missing last speech sample.
+        try:
+            import wave
+            with wave.open(str(mix), "rb") as pcm:
+                if (pcm.getframerate() != validated["sample_rate"]
+                        or pcm.getnframes() != validated["sample_count"]):
+                    raise WorkerError("A mixagem perdeu amostras do áudio mestre; exportação bloqueada.")
+        except (wave.Error, EOFError) as error:
+            raise WorkerError("A mixagem final do áudio natural precisa ser PCM WAV íntegro.") from error
     source_meta = ffprobe(source)
     stream = next(item for item in source_meta["streams"] if item.get("codec_type") == "video")
     width, height = int(stream["width"]), int(stream["height"])
@@ -2002,7 +2874,8 @@ def finalize(video: Path, mix: Path, source: Path, job_dir: Path, duration: floa
         run([
             "ffmpeg", "-y", "-i", str(video), "-i", str(mix), "-map", "0:v:0", "-map", "1:a:0",
             "-vf", scale, *video_args, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
-            "-ac", "2", "-t", str(duration), "-movflags", "+faststart", str(output),
+            "-ac", "2", *([] if master_mode else ["-t", str(duration)]),
+            "-movflags", "+faststart", str(output),
         ], log=log)
 
     nvenc_available = encoders.returncode == 0 and "h264_nvenc" in encoders.stdout
@@ -2026,7 +2899,7 @@ def finalize(video: Path, mix: Path, source: Path, job_dir: Path, duration: floa
             with log.open("a", encoding="utf-8") as handle:
                 handle.write("\nNVENC indisponível neste Pod; repetindo apenas a exportação final com libx264.\n")
             encode(cpu_args)
-    assert_video_stream_coverage(output, source)
+    assert_video_stream_coverage(output, video if master_mode else source)
     return output
 
 

@@ -10,12 +10,13 @@ import unittest
 import warnings
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from languages import languages_payload, supports_original_voice
 from pipeline import Job, PipelineError, probe_video
 from studio_bridge import (
     PIPELINE_VERSION, SCHEMA_VERSION, export_approved_review, import_review,
-    import_studio_result, prepare_studio_package,
+    import_studio_result, prepare_studio_package, _validate_voice_reference_proof,
 )
 
 
@@ -39,7 +40,9 @@ class StudioBridgeTests(unittest.TestCase):
         cls.wav = Path(cls.shared.name) / "voice.wav"
         cls.mp3 = Path(cls.shared.name) / "voice.mp3"
         for target in (cls.wav, cls.mp3):
-            subprocess.run([shutil.which("ffmpeg"), "-y", "-i", str(cls.source), "-vn", str(target)], check=True, capture_output=True)
+            # The uploaded-audio fixture is exactly the image timeline. AAC
+            # decoder padding is tested separately, never accepted as voice to cut.
+            subprocess.run([shutil.which("ffmpeg"), "-y", "-i", str(cls.source), "-vn", "-t", "3", str(target)], check=True, capture_output=True)
 
     @classmethod
     def tearDownClass(cls):
@@ -52,7 +55,7 @@ class StudioBridgeTests(unittest.TestCase):
         shutil.copy2(self.source, source)
         self.job = Job(id="abc123abc123", directory=self.root, input_path=source, options={
             "operation": "dub_video", "target_languages": ["pl-PL", "en-US"],
-            "voice_clone_consent": True, "require_lipsync": True,
+            "voice_clone_consent": True, "require_lipsync": True, "timing_mode": "source_video",
         }, metadata=probe_video(source))
         prepare_studio_package(self.job)
         self.manifest = json.loads((self.root / "studio-manifest.json").read_text(encoding="utf-8"))
@@ -75,7 +78,7 @@ class StudioBridgeTests(unittest.TestCase):
             "no_lipsync_segments": [],
         }
 
-    def make_result(self, *, media=None, edit=None, extra=None, failed_language=None, checksum_error=False, segments_edit=None, audio_media=None):
+    def make_result(self, *, media=None, edit=None, extra=None, failed_language=None, checksum_error=False, segments_edit=None, audio_media=None, omitted_roles=()):
         result = {
             "schema_version": SCHEMA_VERSION, "pipeline_version": PIPELINE_VERSION,
             "job_id": self.job.id, "input_sha256": self.manifest["input_sha256"], "outputs": [],
@@ -108,6 +111,11 @@ class StudioBridgeTests(unittest.TestCase):
             else:
                 files["video"] = f"{base}/video.mp4"
                 blobs[files["video"]] = (media or self.source).read_bytes()
+                if operation == "lipsync_video":
+                    for role, source in (("wav", self.wav), ("mp3", self.mp3)):
+                        if role not in omitted_roles:
+                            files[role] = f"{base}/voice.{role}"
+                            blobs[files[role]] = (audio_media or {}).get(role, source).read_bytes()
                 if operation == "dub_video":
                     if segments_edit:
                         segments_edit(segments)
@@ -191,6 +199,56 @@ class StudioBridgeTests(unittest.TestCase):
             import_studio_result(self.job, self.make_result(media=self.truncated))
         self.assertFalse((self.root / "studio-results").exists())
 
+    def padded_source(self):
+        source = self.root / "source-with-aac-padding.mp4"
+        subprocess.run([
+            shutil.which("ffmpeg"), "-y", "-i", str(self.source), "-map", "0:v:0", "-map", "0:a:0",
+            "-c:v", "copy", "-af", "apad=pad_dur=0.4", "-c:a", "aac", str(source),
+        ], check=True, capture_output=True)
+        self.job.input_path = source
+        self.job.metadata = probe_video(source)
+        prepare_studio_package(self.job)
+        self.manifest = json.loads((self.root / "studio-manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(self.manifest["input_metadata"]["duration"], 3.0)
+        self.assertGreater(self.manifest["input_metadata"]["container_duration"], 3.05)
+        return source
+
+    def test_lipsync_coverage_uses_source_video_not_padded_container(self):
+        self.padded_source()
+        result = import_studio_result(self.job, self.make_result())
+        self.assertEqual(result["success_count"], 2)
+        for output in result["outputs"]:
+            self.assertEqual(output["validation"]["media"]["video"]["video_duration"], 3.0)
+            self.assertTrue(output["validation"]["lipsync_confirmed"])
+
+    def test_padded_container_does_not_excuse_uncovered_source_tail(self):
+        self.padded_source()
+        def omit_tail(report):
+            report["lipsync"]["confirmed_segments"][-1]["end"] = 2.8
+        with self.assertRaisesRegex(PipelineError, "não cobre o final"):
+            import_studio_result(self.job, self.make_result(edit=omit_tail))
+        self.assertIsNone(self.job.output_path)
+        self.assertFalse((self.root / "studio-results").exists())
+
+    def test_actual_output_stream_is_still_checked_after_source_coverage(self):
+        self.padded_source()
+        shortened = self.root / "short-output-long-audio.mp4"
+        subprocess.run([
+            shutil.which("ffmpeg"), "-y", "-i", str(self.source), "-filter_complex",
+            "[0:v]trim=duration=2.8,setpts=PTS-STARTPTS[v]", "-map", "[v]", "-map", "0:a:0",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(shortened),
+        ], check=True, capture_output=True)
+        with self.assertRaisesRegex(PipelineError, "tempos inseguros"):
+            import_studio_result(self.job, self.make_result(media=shortened))
+        self.assertIsNone(self.job.output_path)
+        self.assertFalse((self.root / "studio-results").exists())
+
+    def test_source_without_measured_video_duration_cannot_use_container_fallback(self):
+        with patch("studio_bridge._probe_streams", return_value={"video_duration": None}):
+            with self.assertRaisesRegex(PipelineError, "vídeo original não possui"):
+                import_studio_result(self.job, self.make_result())
+        self.assertIsNone(self.job.output_path)
+
     def test_generic_voice_or_ambiguous_lipsync_are_rejected(self):
         for edit, expected in [
             (lambda report: report["voice_clone"].update(confirmed=False), "timbre original"),
@@ -251,6 +309,70 @@ class StudioBridgeTests(unittest.TestCase):
         self.assertIsNone(self.job.output_path)
         self.assertFalse((self.root / "studio-results").exists())
 
+    def spatial_contract(self, count=2):
+        return {
+            "policy": "tracked-face-box-only-inner-feather-v1",
+            "outside_face_source": "original-frame-clock", "mask_outside_tracked_box": 0,
+            "mask_expands_box": False, "segments": count,
+            "encoding_note": "H.264 lossy encoding may alter decoded pixels; generated content is spatially confined.",
+        }
+
+    def test_optional_spatial_contract_accepts_renderer_proof_and_legacy_absence(self):
+        legacy = import_studio_result(self.job, self.make_result())
+        self.assertEqual(legacy["success_count"], 2)
+        for include_note in (True, False):
+            value = self.spatial_contract()
+            if not include_note:
+                value.pop("encoding_note")
+            result = import_studio_result(self.job, self.make_result(edit=lambda report: report.update(spatial_composition=value)))
+            self.assertEqual(result["success_count"], 2)
+            for output in result["outputs"]:
+                report = json.loads((self.root / output["files"]["report"]).read_text(encoding="utf-8"))
+                self.assertEqual(report["spatial_composition"], value)
+
+    def test_present_malformed_spatial_contract_never_replaces_previous_results(self):
+        previous = import_studio_result(self.job, self.make_result())
+        previous_output = self.job.output_path
+        previous_bytes = previous_output.read_bytes()
+        invalid = [None, [], {}, self.spatial_contract(count=True), self.spatial_contract(count=1)]
+        for key, value in (
+            ("policy", "whole-frame-overlay"), ("outside_face_source", "normalized-AVI"),
+            ("mask_outside_tracked_box", False), ("mask_outside_tracked_box", 0.0),
+            ("mask_outside_tracked_box", 255), ("mask_expands_box", True),
+            ("mask_expands_box", 0), ("segments", 2.0),
+            ("encoding_note", "Decoded pixels are guaranteed identical"), ("private_log", "not part of public proof"),
+        ):
+            invalid.append({**self.spatial_contract(), key: value})
+        for key in self.spatial_contract():
+            if key != "encoding_note":
+                value = self.spatial_contract()
+                del value[key]
+                invalid.append(value)
+        for index, value in enumerate(invalid):
+            with self.subTest(case=index), self.assertRaisesRegex(PipelineError, "composição espacial"):
+                import_studio_result(self.job, self.make_result(edit=lambda report: report.update(spatial_composition=value)))
+            self.assertEqual(self.job.output_path, previous_output)
+            self.assertEqual(self.job.metadata["studio_result"], previous)
+            self.assertEqual(previous_output.read_bytes(), previous_bytes)
+
+    def test_spatial_claim_requires_rendered_segments_and_requested_lipsync(self):
+        def voiceover(report):
+            report["lipsync"].update(confirmed_segments=[], confirmed=False, applied=False,
+                                     no_visible_speaking_face=True, scene_analysis_complete=True)
+            report["preserved_no_speaker_visual_segments"] = [{"start": 0.0, "end": 3.0}]
+            report["spatial_composition"] = self.spatial_contract(count=0)
+        with self.assertRaisesRegex(PipelineError, "composição espacial"):
+            import_studio_result(self.job, self.make_result(edit=voiceover))
+        self.job.options["require_lipsync"] = False
+        prepare_studio_package(self.job)
+        self.manifest = self.job.metadata["studio"]["manifest"]
+        def disabled(report):
+            report["lipsync"] = {"required": False, "confirmed": False, "applied": False}
+            report["spatial_composition"] = self.spatial_contract()
+        with self.assertRaisesRegex(PipelineError, "composição espacial"):
+            import_studio_result(self.job, self.make_result(edit=disabled))
+        self.assertIsNone(self.job.output_path)
+
     def test_result_and_report_bind_operation_and_all_input_checksums(self):
         for edit in (lambda report: report.update(operation="lipsync_video"),
                      lambda report: report.update(input_checksums={}),
@@ -275,6 +397,24 @@ class StudioBridgeTests(unittest.TestCase):
         self.job.options.update(operation="lipsync_video", target_languages=["und"], audio_path=str(audio))
         prepare_studio_package(self.job)
         self.manifest = self.job.metadata["studio"]["manifest"]
+
+    def test_audio_lipsync_requires_wav_and_mp3_exports(self):
+        audio = self.root / "uploaded.wav"
+        # The source AAC can decode to a WAV slightly longer than its 3s video;
+        # keep this fixture inside the real no-trimming input contract.
+        subprocess.run([shutil.which("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y",
+                        "-i", str(self.wav), "-t", "2.5", str(audio)], check=True, capture_output=True)
+        self.lipsync_job(audio)
+        accepted = import_studio_result(self.job, self.make_result())
+        self.assertEqual((accepted["success_count"], accepted["failed_count"]), (1, 0))
+        self.assertEqual(set(accepted["outputs"][0]["files"]), {"video", "wav", "mp3", "report"})
+        existing = self.job.output_path
+        for missing in ("wav", "mp3"):
+            with self.subTest(missing=missing), self.assertRaisesRegex(PipelineError, "incompleto"):
+                import_studio_result(self.job, self.make_result(omitted_roles={missing}))
+            self.assertEqual(self.job.output_path, existing)
+            self.assertEqual(self.job.metadata["studio_result"], accepted)
+            self.assertTrue(existing.is_file())
 
     def test_audio_lipsync_cannot_claim_success_without_rendered_faces(self):
         audio = self.root / "uploaded.wav"
@@ -309,9 +449,9 @@ class StudioBridgeTests(unittest.TestCase):
     def test_audio_lipsync_refuses_to_trim_uploaded_audio_larger_than_video(self):
         larger = self.root / "uploaded-too-long.wav"
         subprocess.run([shutil.which("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y", "-i", str(self.wav), "-af", "apad", "-t", "3.1", str(larger)], check=True, capture_output=True)
-        self.lipsync_job(larger)
-        with self.assertRaisesRegex(PipelineError, "não pode ser cortado"):
-            import_studio_result(self.job, self.make_result())
+        with self.assertRaisesRegex(PipelineError, "áudio enviado excede"):
+            self.lipsync_job(larger)
+        self.assertIsNone(self.job.output_path)
 
     def test_dubbing_without_lipsync_requires_explicit_opt_out_and_honest_report(self):
         def without_lipsync(report):
@@ -557,6 +697,122 @@ class StudioBridgeTests(unittest.TestCase):
         self.job.options["target_languages"] = ["uk-UA"]
         with self.assertRaisesRegex(PipelineError, "timbre original"):
             prepare_studio_package(self.job)
+
+
+    def test_three_speaker_result_accepts_complete_reference_provenance_without_quality_claim(self):
+        speakers = [f"SPEAKER_{index:02d}" for index in range(3)]
+        def segments(payload):
+            payload["segments"] = [{"id": index + 1, "start": float(index), "end": index + 0.9,
+                                    "speaker": speaker, "text": f"Pessoa {index + 1}", "translated_text": f"Voice {index + 1}"}
+                                   for index, speaker in enumerate(speakers)]
+        def report(value):
+            value["references"] = {speaker: hashlib.sha256(speaker.encode()).hexdigest() for speaker in speakers}
+            value["reference_validation"] = {speaker: {"speech_seconds": 0.9, "checked_seconds": 1.0,
+                                                       "rms_dbfs": -12.0, "method": "Synthetic VAD contract; no timbre proof"}
+                                             for speaker in speakers}
+            value["validation_state"] = "machine_checks_pending_human_review"
+        result = import_studio_result(self.job, self.make_result(edit=report, segments_edit=segments))
+        self.assertEqual(result["success_count"], 2)
+        for output in result["outputs"]:
+            actual = json.loads((self.job.directory / output["files"]["report"]).read_text(encoding="utf-8"))
+            self.assertEqual(actual["validation_state"], "machine_checks_pending_human_review")
+            self.assertEqual(set(actual["references"]), set(speakers))
+
+    def test_contradictory_reference_proof_rejects_import_without_replacing_previous_result(self):
+        import_studio_result(self.job, self.make_result())
+        previous = copy.deepcopy(self.job.metadata["studio_result"])
+        paths = (self.job.output_path, self.job.report_path)
+        published = {str(path.relative_to(self.root)): path.read_bytes() for path in (self.root / "studio-results").rglob("*") if path.is_file()}
+        changes = (
+            lambda report: report.update(references={"SPEAKER_00": "not-a-checksum"}),
+            lambda report: report.update(references={"SPEAKER_01": "a" * 64}),
+            lambda report: report.update(references={"SPEAKER_00": "a" * 64}, reference_validation={"SPEAKER_00": {"validated": True}}),
+        )
+        for change in changes:
+            with self.subTest(change=changes.index(change)), self.assertRaisesRegex(PipelineError, "referência|referências|referencia"):
+                import_studio_result(self.job, self.make_result(edit=change))
+            self.assertEqual(self.job.metadata["studio_result"], previous)
+            self.assertEqual((self.job.output_path, self.job.report_path), paths)
+            self.assertEqual({str(path.relative_to(self.root)): path.read_bytes() for path in (self.root / "studio-results").rglob("*") if path.is_file()}, published)
+
+
+class VoiceReferenceProofTests(unittest.TestCase):
+    def setUp(self):
+        self.manifest = {"operation": "dub_video", "inputs": {}}
+        self.segments = [{"id": index + 1, "speaker": f"SPEAKER_{index:02d}", "text": f"Source {index}", "translated_text": f"Target {index}"} for index in range(3)]
+        self.report = {"references": {item["speaker"]: hashlib.sha256(item["speaker"].encode()).hexdigest() for item in self.segments},
+                       "reference_validation": {item["speaker"]: {"speech_seconds": 0.9, "checked_seconds": 1.0,
+                                                                  "rms_dbfs": -20.0, "method": "Synthetic VAD contract; review timbre separately"}
+                                                for item in self.segments}}
+
+    def validate(self, report=None, segments=None, manifest=None):
+        _validate_voice_reference_proof(report if report is not None else self.report,
+                                        manifest if manifest is not None else self.manifest,
+                                        segments if segments is not None else self.segments)
+
+    def test_absent_legacy_proof_is_compatible_but_present_analysis_requires_hash_map(self):
+        _validate_voice_reference_proof({}, self.manifest, None)
+        self.validate({"references": self.report["references"]})
+        with self.assertRaisesRegex(PipelineError, "incompleta"):
+            self.validate({"reference_validation": self.report["reference_validation"]})
+
+    def test_every_actual_speaker_requires_a_valid_hash_without_unused_voice_fallback(self):
+        for hashes in (None, [], {}, {"SPEAKER_00": "a" * 64}, {**self.report["references"], "UNUSED": "a" * 64},
+                       {**self.report["references"], "SPEAKER_01": "not-sha256"},
+                       {**self.report["references"], "SPEAKER_01": True}):
+            with self.subTest(hashes=hashes), self.assertRaises(PipelineError):
+                self.validate({"references": hashes})
+        self.validate()
+
+    def test_voice_proof_matches_actual_speaker_ids_and_text_without_defaulting_missing_speaker(self):
+        for key in ("speaker", "id", "text", "translated_text"):
+            report = copy.deepcopy(self.report)
+            report["segments"] = copy.deepcopy(self.segments)
+            report["segments"][1][key] = "wrong"
+            with self.subTest(key=key), self.assertRaisesRegex(PipelineError, "locutores/textos"):
+                self.validate(report)
+        for speaker in (None, "", "../voice", True):
+            segments = copy.deepcopy(self.segments)
+            segments[1]["speaker"] = speaker
+            with self.subTest(speaker=speaker), self.assertRaisesRegex(PipelineError, "locutores válidos"):
+                self.validate(segments=segments)
+        report = copy.deepcopy(self.report)
+        report["segments"] = copy.deepcopy(self.segments)
+        self.validate(report)
+
+    def test_reference_analysis_requires_matching_speaker_keys(self):
+        for validation in (None, [], {}, {"SPEAKER_00": self.report["reference_validation"]["SPEAKER_00"]},
+                           {**self.report["reference_validation"], "UNUSED": {}}):
+            with self.subTest(validation=validation), self.assertRaisesRegex(PipelineError, "não corresponde"):
+                self.validate({**self.report, "reference_validation": validation})
+
+    def test_reference_analysis_rejects_invalid_numeric_ranges_and_claim_only_flags(self):
+        replacements = (("speech_seconds", 0.59), ("speech_seconds", 1.2), ("speech_seconds", True),
+                        ("checked_seconds", 0.79), ("checked_seconds", 121), ("checked_seconds", float("inf")),
+                        ("rms_dbfs", -81), ("rms_dbfs", 1), ("rms_dbfs", float("nan")), ("method", ""), ("method", False))
+        for key, value in replacements:
+            report = copy.deepcopy(self.report)
+            report["reference_validation"]["SPEAKER_01"][key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(PipelineError):
+                self.validate(report)
+        report = copy.deepcopy(self.report)
+        report["reference_validation"]["SPEAKER_01"] = {"validated": True}
+        with self.assertRaisesRegex(PipelineError, "incompleta"):
+            self.validate(report)
+
+    def test_text_to_voice_binds_present_proof_to_its_one_authorized_input(self):
+        manifest = {"operation": "text_to_voice", "inputs": {"reference": {"sha256": "a" * 64}}}
+        segments = [self.segments[0]]
+        self.validate({"references": {"SPEAKER_00": "a" * 64}}, segments, manifest)
+        with self.assertRaisesRegex(PipelineError, "referência única autorizada"):
+            self.validate({"references": {"SPEAKER_00": "b" * 64}}, segments, manifest)
+        with self.assertRaisesRegex(PipelineError, "referência única autorizada"):
+            self.validate({"references": {item["speaker"]: "a" * 64 for item in self.segments}}, self.segments, manifest)
+
+    def test_uploaded_audio_cannot_claim_unexecuted_voice_reference_analysis(self):
+        self.validate({}, manifest={"operation": "lipsync_video"})
+        with self.assertRaisesRegex(PipelineError, "não executada"):
+            self.validate(manifest={"operation": "lipsync_video"})
 
 
 class LanguageCapabilityTests(unittest.TestCase):

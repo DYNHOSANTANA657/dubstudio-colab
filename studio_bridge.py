@@ -18,11 +18,14 @@ import subprocess
 import tempfile
 import time
 import uuid
+import wave
 import zipfile
 from pathlib import Path, PurePosixPath
+from fractions import Fraction
 from typing import Any
 
 from colab_bridge import MAX_DURATION_SECONDS, _package_source, _tail_max_volume, sha256_file, target_dimensions
+from colab.dubstudio_runner_v2 import PipelineError as MediaTimelineError, input_stream_duration, public_spatial_composition
 from languages import supports_original_voice
 from pipeline import Job, PipelineError, probe_video
 
@@ -38,6 +41,7 @@ OPERATIONS = {"dub_video", "lipsync_video", "text_to_voice"}
 FILE_EXTENSIONS = {
     "video": {".mp4"}, "wav": {".wav"}, "mp3": {".mp3"}, "report": {".json"},
     "segments": {".json"}, "original_srt": {".srt"}, "translation_srt": {".srt"},
+    "timeline": {".json"}, "master_audio": {".wav"},
 }
 _LANGUAGE_RE = re.compile(r"^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
 _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -86,6 +90,34 @@ def _check_identity(job: Job) -> None:
         raise PipelineError("O identificador do projeto não é válido.")
 
 
+def _package_timing_mode(job: Job) -> str:
+    """New projects use natural audio; never silently migrate a saved project."""
+    mode = job.options.get("timing_mode")
+    if mode is None:
+        existing = job.directory / MANIFEST_NAME
+        if existing.is_file():
+            try:
+                saved = json.loads(existing.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise PipelineError("O manifesto salvo não é válido para preservar o modo de duração.") from exc
+            if not isinstance(saved, dict) or saved.get("job_id") != job.id:
+                raise PipelineError("O manifesto salvo pertence a outro projeto.")
+            mode = saved.get("options", {}).get("timing_mode", "source_video")
+        else:
+            mode = "audio_master"
+    if mode not in {"audio_master", "source_video"}:
+        raise PipelineError("O modo de duração do projeto não é válido.")
+    return mode
+
+
+def _audio_master_mode(manifest: dict[str, Any]) -> bool:
+    # Manifests created before this feature retain their original clock.
+    mode = manifest.get("options", {}).get("timing_mode", "source_video")
+    if mode not in {"audio_master", "source_video"}:
+        raise PipelineError("O manifesto contém um modo de duração não compatível.")
+    return mode == "audio_master"
+
+
 def prepare_studio_package(job: Job) -> Path:
     """Create manifest v2 and an offline ZIP; no cloud side effects occur here."""
     _check_identity(job)
@@ -93,6 +125,7 @@ def prepare_studio_package(job: Job) -> Path:
     if operation not in OPERATIONS:
         raise PipelineError("A operação solicitada não existe no Studio.")
     targets = _language_list(job)
+    timing_mode = _package_timing_mode(job)
     consent = job.options.get("voice_clone_consent") is True
     if operation in {"dub_video", "text_to_voice"} and not consent:
         raise PipelineError("Confirme a autorização para preservar o timbre da voz original.")
@@ -105,15 +138,23 @@ def prepare_studio_package(job: Job) -> Path:
     inputs: dict[str, dict[str, str]] = {}
     input_files: dict[str, Path] = {}
     metadata = probe_video(source)
+    metadata["container_duration"] = metadata.get("duration")
     proxied = False
     if operation in {"dub_video", "lipsync_video"}:
         if not metadata.get("video"):
             raise PipelineError("Escolha um arquivo com uma faixa de vídeo válida.")
         if operation == "dub_video" and not metadata.get("audio"):
             raise PipelineError("O vídeo precisa conter a voz original para a dublagem.")
+        metadata["duration"] = _source_media_duration(job, operation)
+        metadata["video_duration"] = metadata["duration"]
+        metadata["duration_basis"] = "v:0"
         if not 0 < float(metadata.get("duration", 0)) <= MAX_DURATION_SECONDS:
             raise PipelineError("O Studio aceita vídeos com duração máxima de 20 minutos.")
         source, proxied = _package_source(job, metadata)
+        packaged_duration = _probe_streams(source)["video_duration"]
+        if packaged_duration is None or abs(packaged_duration - metadata["video_duration"]) > 0.05:
+            raise PipelineError("O proxy alterou a duração real da faixa de vídeo; o pacote foi bloqueado.")
+        metadata["packaged_video_duration"] = packaged_duration
         input_files["video"] = source
     else:
         text = job.options.get("text", "")
@@ -125,6 +166,10 @@ def prepare_studio_package(job: Job) -> Path:
             raise PipelineError("A referência vocal precisa conter uma faixa de áudio.")
         source = reference
         metadata = reference_metadata
+        metadata["container_duration"] = metadata.get("duration")
+        metadata["duration"] = _probe_streams(reference)["audio_duration"]
+        metadata["audio_duration"] = metadata["duration"]
+        metadata["duration_basis"] = "a:0"
         input_files["reference"] = source
     for role in ("audio", "reference"):
         extra = _input_path(job, role)
@@ -134,6 +179,12 @@ def prepare_studio_package(job: Job) -> Path:
             input_files[role] = extra
     if operation == "lipsync_video" and "audio" not in input_files:
         raise PipelineError("Envie o áudio que será sincronizado com o vídeo.")
+    if operation == "lipsync_video":
+        submitted_duration = _probe_streams(input_files["audio"])["audio_duration"]
+        if submitted_duration is None or submitted_duration <= 0:
+            raise PipelineError("O áudio enviado não possui uma duração válida.")
+        if timing_mode != "audio_master" and submitted_duration > metadata["duration"] + 0.000001:
+            raise PipelineError("O áudio enviado excede a duração da faixa de vídeo e seria cortado; ajuste os arquivos antes de preparar o pacote.")
     for role, path in input_files.items():
         # Fixed role names keep same-name uploads from colliding in the archive.
         inputs[role] = {"path": f"input/{role}{path.suffix.lower()}", "sha256": sha256_file(path)}
@@ -143,6 +194,7 @@ def prepare_studio_package(job: Job) -> Path:
         "review_mode": "automatic_optional", "performance_profile": "fast_lipsync",
         "speaker_count": "auto", "text": "", "face_selection": "auto", "subtitle_mode": "none",
     }.items()}
+    options["timing_mode"] = timing_mode
     if operation == "text_to_voice":
         options["require_lipsync"] = False
     if operation == "lipsync_video":
@@ -159,7 +211,8 @@ def prepare_studio_package(job: Job) -> Path:
         "options": options, "authorization": {"voice_clone_confirmed": consent},
         "input_metadata": metadata, "proxy_created": proxied,
         "original_name": job.options.get("original_name", job.input_path.name),
-        "output_contract": {"max_resolution": "1080p", "duration_tolerance_seconds": 1.0},
+        "output_contract": {"max_resolution": "1080p", "duration_tolerance_seconds": 1.0,
+                            "duration_basis": "master_audio_samples" if timing_mode == "audio_master" else "source_video"},
     }
     manifest_path = job.directory / MANIFEST_NAME
     _write_json(manifest_path, manifest)
@@ -171,7 +224,7 @@ def prepare_studio_package(job: Job) -> Path:
             for role, path in input_files.items():
                 archive.write(path, inputs[role]["path"])
             # Bundle only public worker source; never settings or runtime files.
-            for name in ("dubstudio_bootstrap.py", "dubstudio_runner_v2.py", "dubstudio_colab_worker.py", "dubstudio_translate.py"):
+            for name in ("dubstudio_bootstrap.py", "dubstudio_runner_v2.py", "dubstudio_colab_worker.py", "dubstudio_translate.py", "dubstudio_audio_master.py"):
                 path = ROOT / "colab" / name
                 archive.write(path, f"worker/{path.name}")
             for name in ("requirements-app.txt", "requirements-musetalk.txt"):
@@ -310,6 +363,53 @@ def _validate_result_binding(payload: dict[str, Any], manifest: dict[str, Any]) 
         raise PipelineError("O resultado não corresponde a todas as mídias de entrada, incluindo o áudio enviado.")
 
 
+def _validate_spatial_composition(report: dict[str, Any], expected_segments: int) -> None:
+    """An optional renderer claim must match its bounded, public face-only contract."""
+    if "spatial_composition" not in report:
+        return  # Older reports make no spatial claim; do not invent one.
+    value = report["spatial_composition"]
+    if isinstance(value, dict) and value.get("policy") == "perioral-mapped-source-dwpose68-inner-feather-v1":
+        hashes = ("source_video_sha256", "timeline_sha256", "output_base_sha256", "audio_master_sha256")
+        if (report.get("timing_mode") != "audio_master"
+                or value.get("outside_face_source") != "mapped-source-frame-clock"
+                or any(not _SHA_RE.fullmatch(str(value.get(key, ""))) for key in hashes)):
+            raise PipelineError("A composição perioral não está ligada ao relógio de vídeo adaptado.")
+        # Retiming changes the clock, not the facial/landmark confinement rules.
+        original_contract = {key: item for key, item in value.items() if key not in hashes}
+        original_contract.update(policy="perioral-source-dwpose68-inner-feather-v1", outside_face_source="original-frame-clock")
+        try:
+            public_value = public_spatial_composition(original_contract, expected_segments)
+        except MediaTimelineError as error:
+            raise PipelineError(str(error)) from error
+        if original_contract != public_value:
+            raise PipelineError("A composição perioral adaptada contém campos privados ou alegações não conferidas.")
+        if any(record["source_sha256"] != value["output_base_sha256"] for record in value["evidence"]):
+            raise PipelineError("As máscaras faciais não correspondem ao vídeo base adaptado.")
+        return
+    if isinstance(value, dict) and value.get('policy') == 'perioral-source-dwpose68-inner-feather-v1':
+        try:
+            public_value = public_spatial_composition(value, expected_segments)
+        except MediaTimelineError as error:
+            raise PipelineError(str(error)) from error
+        if value != public_value:
+            raise PipelineError('A composição espacial perioral contém campos privados ou alegações sem conferência visual.')
+        return
+    required = {"policy", "outside_face_source", "mask_outside_tracked_box", "mask_expands_box", "segments"}
+    allowed = required | {"encoding_note"}
+    encoding_note = "H.264 lossy encoding may alter decoded pixels; generated content is spatially confined."
+    if (not isinstance(value, dict) or not required.issubset(value) or not set(value).issubset(allowed)
+            or value.get("policy") != "tracked-face-box-only-inner-feather-v1"
+            or value.get("outside_face_source") != "original-frame-clock"
+            or type(value.get("mask_outside_tracked_box")) is not int
+            or value["mask_outside_tracked_box"] != 0
+            or value.get("mask_expands_box") is not False
+            or type(value.get("segments")) is not int
+            or type(expected_segments) is not int or not 1 <= expected_segments <= 30000
+            or value["segments"] != expected_segments
+            or ("encoding_note" in value and value["encoding_note"] != encoding_note)):
+        raise PipelineError("A composição espacial do lip-sync não possui um contrato facial válido.")
+
+
 def _validate_lipsync(report: dict[str, Any], duration: float, operation: str = "dub_video") -> bool:
     proof = report.get("lipsync")
     if not isinstance(proof, dict) or proof.get("required") is not True:
@@ -366,25 +466,87 @@ def _validate_lipsync(report: dict[str, Any], duration: float, operation: str = 
         cursor = end
     if cursor < duration - 0.05:
         raise PipelineError("O relatório não cobre o final do vídeo com cenas sincronizadas ou preservadas.")
+    _validate_spatial_composition(report, len(segments))
     return bool(segments)
 
 
-def _validate_report(report: dict[str, Any], job: Job, manifest: dict[str, Any], language: str) -> None:
+def _validate_report(report: dict[str, Any], job: Job, manifest: dict[str, Any], language: str,
+                     timing: dict[str, Any] | None = None) -> None:
     _validate_identity(report, job, manifest)
     _validate_result_binding(report, manifest)
     if report.get("pipeline_version") != PIPELINE_VERSION or report.get("target_language") != language:
         raise PipelineError("O relatório não corresponde ao idioma ou à versão do pipeline solicitado.")
     operation = manifest["operation"]
+    audio_master_video = _audio_master_mode(manifest) and operation != "text_to_voice"
+    if audio_master_video and (report.get("timing_mode") != "audio_master" or timing is None):
+        raise PipelineError("O resultado não comprova o modo de áudio natural deste projeto.")
+    if not _audio_master_mode(manifest) and report.get("timing_mode", "source_video") != "source_video":
+        raise PipelineError("O resultado alterou o modo de duração de um projeto legado.")
     if operation in {"dub_video", "text_to_voice"}:
         proof = report.get("voice_clone")
         if manifest.get("authorization", {}).get("voice_clone_confirmed") is not True or not isinstance(proof, dict) or proof.get("required") is not True or proof.get("confirmed") is not True or proof.get("authorized") is not True:
             raise PipelineError("O resultado não confirma a preservação autorizada do timbre original.")
     if manifest["options"].get("require_lipsync") is True:
-        _validate_lipsync(report, float(manifest["input_metadata"]["duration"]), operation)
+        # Container duration can include AAC padding after the last image. Use
+        # the actual local source stream, never the imported report's duration.
+        # The final output stream is checked independently again before publish.
+        original_video = _input_path(job, "video") or job.input_path
+        video_duration = timing["video_duration"] if audio_master_video else _probe_streams(original_video)["video_duration"]
+        if video_duration is None or video_duration <= 0:
+            raise PipelineError("O vídeo original não possui uma duração de faixa de vídeo válida para conferir o lip-sync.")
+        _validate_lipsync(report, video_duration, operation)
     else:
         proof = report.get("lipsync")
         if not isinstance(proof, dict) or proof.get("required") is not False or proof.get("confirmed") is not False or proof.get("applied", False) is not False:
             raise PipelineError("O relatório precisa declarar que o lip-sync foi desativado, sem confirmar uma etapa não solicitada.")
+        _validate_spatial_composition(report, 0)
+
+
+def _validate_voice_reference_proof(report: dict[str, Any], manifest: dict[str, Any], segments: Any) -> None:
+    """Check optional reference provenance, never infer audible timbre from hashes.
+
+    Older results without either field make no reference-integrity claim. A claim
+    that is present must agree with every speaker in the actual output evidence.
+    """
+    if "references" not in report and "reference_validation" not in report:
+        return
+    if manifest["operation"] not in {"dub_video", "text_to_voice"}:
+        raise PipelineError("Áudio enviado não pode declarar referências de clonagem vocal não executada.")
+    references = report.get("references")
+    if not isinstance(segments, list) or not segments or not isinstance(references, dict) or not references:
+        raise PipelineError("A evidência de referências vocais está incompleta.")
+    speakers: set[str] = set()
+    for segment in segments:
+        speaker = segment.get("speaker") if isinstance(segment, dict) else None
+        if not isinstance(speaker, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", speaker):
+            raise PipelineError("A evidência de referências vocais não possui locutores válidos.")
+        speakers.add(speaker)
+    if set(references) != speakers or any(not isinstance(value, str) or not _SHA_RE.fullmatch(value) for value in references.values()):
+        raise PipelineError("As referências vocais precisam conter um SHA-256 para cada locutor do resultado.")
+    if "segments" in report:
+        claimed = report["segments"]
+        fields = ("id", "speaker", "text", "translated_text")
+        if not isinstance(claimed, list) or len(claimed) != len(segments) or any(
+                not isinstance(item, dict) or any(item.get(key) != actual.get(key) for key in fields)
+                for item, actual in zip(claimed, segments)):
+            raise PipelineError("Os locutores/textos da prova vocal não correspondem aos trechos do resultado.")
+    if manifest["operation"] == "text_to_voice":
+        authorized = manifest.get("inputs", {}).get("reference", {}).get("sha256")
+        if len(speakers) != 1 or (authorized is not None and any(value != authorized for value in references.values())):
+            raise PipelineError("A prova vocal não corresponde à referência única autorizada para texto em voz.")
+    if "reference_validation" not in report:
+        return  # Older hash-only proof has no VAD/energy claim to validate.
+    validation = report["reference_validation"]
+    if not isinstance(validation, dict) or set(validation) != speakers:
+        raise PipelineError("A análise das referências vocais não corresponde aos locutores do resultado.")
+    for proof in validation.values():
+        if not isinstance(proof, dict) or not isinstance(proof.get("method"), str) or not proof["method"].strip() or len(proof["method"]) > 512:
+            raise PipelineError("A análise de uma referência vocal está incompleta.")
+        speech = _number(proof.get("speech_seconds"), "A fala da referência vocal")
+        checked = _number(proof.get("checked_seconds"), "A duração analisada da referência vocal")
+        energy = _number(proof.get("rms_dbfs"), "A energia da referência vocal")
+        if not 0.8 <= checked <= 120.05 or not 0.6 <= speech <= checked + 0.001 or not -80.0 <= energy <= 0.0:
+            raise PipelineError("A análise de uma referência vocal não confirma fala audível válida.")
 
 
 def _probe_streams(path: Path) -> dict[str, Any]:
@@ -393,7 +555,7 @@ def _probe_streams(path: Path) -> dict[str, Any]:
         raise PipelineError("FFprobe é necessário para validar o resultado recebido.")
     result = subprocess.run([
         executable, "-v", "error", "-show_entries",
-        "format=duration,format_name:stream=codec_type,codec_name,duration,width,height,sample_rate,channels", "-of", "json", str(path),
+        "format=duration,format_name:stream=codec_type,codec_name,duration,width,height,sample_rate,channels,r_frame_rate,avg_frame_rate,nb_frames", "-of", "json", str(path),
     ], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90)
     try:
         payload = json.loads(result.stdout)
@@ -404,23 +566,65 @@ def _probe_streams(path: Path) -> dict[str, Any]:
     streams = payload.get("streams", [])
     video = next((item for item in streams if item.get("codec_type") == "video"), None)
     audio = next((item for item in streams if item.get("codec_type") == "audio"), None)
-    # An audio-only container may omit stream duration (WAV). Video cannot use
-    # container duration: long audio can conceal an image ending many seconds early.
-    video_duration = _number(video.get("duration"), "A duração da faixa de vídeo") if video else None
-    audio_duration = _number(audio.get("duration", payload.get("format", {}).get("duration")), "A duração da faixa de áudio") if audio else None
+    # Share the exact Colab measurement contract. Missing duration in MKV/WebM
+    # is resolved from this file's actual frames, never its padded container.
+    payload["_media_path"] = str(path)
+    try:
+        video_duration = input_stream_duration(payload, "video") if video else None
+        audio_duration = input_stream_duration(payload, "audio") if audio else None
+    except MediaTimelineError as exc:
+        raise PipelineError(str(exc)) from exc
     return {"video": video, "audio": audio, "video_duration": video_duration, "audio_duration": audio_duration,
             "format_name": payload.get("format", {}).get("format_name", "")}
 
 
-def _validate_media(path: Path, role: str, job: Job, manifest: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
+def _source_media_duration(job: Job, operation: str) -> float:
+    """Read original local media independently of manifest/report claims."""
+    kind = "audio" if operation == "text_to_voice" else "video"
+    role = "reference" if kind == "audio" else "video"
+    original = _input_path(job, role) or job.input_path
+    duration = _probe_streams(original)[f"{kind}_duration"]
+    if duration is None or not math.isfinite(duration) or duration <= 0:
+        raise PipelineError(f"O original não possui uma duração de faixa de {kind} válida.")
+    return duration
+
+
+def _actual_video_frame_count(path: Path, stream: dict[str, Any]) -> int:
+    try:
+        count = int(stream.get("nb_frames", ""))
+        if count > 0:
+            return count
+    except (ValueError, TypeError):
+        pass
+    # MKV/WebM omit nb_frames. Count the actual source, never infer it from
+    # padded audio/container duration or trust the returned mapping.
+    result = subprocess.run([shutil.which("ffprobe"), "-v", "error", "-select_streams", "v:0", "-count_frames",
+                             "-show_entries", "stream=nb_read_frames", "-of", "json", str(path)],
+                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180)
+    try:
+        count = int(json.loads(result.stdout)["streams"][0]["nb_read_frames"])
+        if result.returncode or count <= 0:
+            raise ValueError()
+    except (ValueError, KeyError, TypeError, IndexError) as error:
+        raise PipelineError("Não foi possível contar os quadros reais do vídeo original.") from error
+    return count
+
+
+def _validate_media(path: Path, role: str, job: Job, manifest: dict[str, Any], report: dict[str, Any],
+                    timing: dict[str, Any] | None = None) -> dict[str, Any]:
     media = _probe_streams(path)
     if not media["audio"] or not media["audio_duration"] or media["audio_duration"] <= 0:
         raise PipelineError("O resultado não contém uma faixa de áudio válida.")
     if role == "video":
-        expected = float(manifest["input_metadata"]["duration"])
-        if not media["video"] or abs(media["video_duration"] - expected) > 1.0:
+        audio_master_video = _audio_master_mode(manifest)
+        if audio_master_video and timing is None:
+            raise PipelineError("Falta o relógio de amostras do áudio mestre para validar o vídeo.")
+        expected = timing["duration"] if audio_master_video else _source_media_duration(job, manifest["operation"])
+        video_tolerance = timing["frame_tolerance_seconds"] if audio_master_video else 1.0
+        audio_tolerance = timing["codec_tolerance_seconds"] if audio_master_video else 1.0
+        if not media["video"] or abs(media["video_duration"] - expected) > video_tolerance:
             raise PipelineError("A duração da faixa de vídeo ficou fora da tolerância de 1 segundo.")
-        if abs(media["audio_duration"] - expected) > 1.0 or media["audio_duration"] < media["video_duration"] - 0.5:
+        if abs(media["audio_duration"] - expected) > audio_tolerance or media["audio_duration"] < media["video_duration"] - (video_tolerance + audio_tolerance if audio_master_video else 0.5):
             raise PipelineError("A duração da faixa de áudio ficou fora da tolerância ou termina antes do vídeo.")
         stream = media["video"]
         original = manifest["input_metadata"]["video"]
@@ -434,18 +638,28 @@ def _validate_media(path: Path, role: str, job: Job, manifest: dict[str, Any], r
             raise PipelineError("O vídeo final precisa usar H.264 com áudio AAC.")
         if "mp4" not in media["format_name"].split(","):
             raise PipelineError("O vídeo final precisa ser um MP4 real, não apenas um arquivo renomeado.")
+        if audio_master_video:
+            try:
+                actual_fps = Fraction(str(stream.get("avg_frame_rate") or stream.get("r_frame_rate")))
+                actual_frames = _actual_video_frame_count(path, stream)
+            except (ValueError, KeyError, ZeroDivisionError, TypeError) as error:
+                raise PipelineError("O vídeo adaptado não informa um relógio de quadros verificável.") from error
+            if actual_fps != Fraction(timing["fps_num"], timing["fps_den"]) or actual_frames != timing["frame_count"]:
+                raise PipelineError("Os quadros reais do vídeo final divergem do mapa de cortes e repetições.")
+            if width != timing["width"] or height != timing["height"]:
+                raise PipelineError("A resolução final não corresponde ao vídeo base usado nas coordenadas faciais.")
         original_audio = job.input_path
         if manifest["operation"] == "lipsync_video":
             original_audio = _input_path(job, "audio") or original_audio
             submitted_duration = _probe_streams(original_audio)["audio_duration"]
-            if submitted_duration is None or submitted_duration > media["video_duration"] + 0.000001:
+            if submitted_duration is None or submitted_duration > media["video_duration"] + (video_tolerance if audio_master_video else 0.000001):
                 raise PipelineError("O áudio enviado excede a faixa final de vídeo e não pode ser cortado.")
             tail = min(5.0, max(0.5, submitted_duration * 0.1), submitted_duration)
             start = max(0.0, submitted_duration - tail)
             # Compare the same timeline window, not the end of a padded video.
             if _audio_window_peak(original_audio, start, tail) > -45 and _audio_window_peak(path, start, tail) < -55:
                 raise PipelineError("O final do áudio enviado ficou silencioso na janela correspondente do resultado.")
-        elif probe_video(original_audio).get("audio"):
+        elif not audio_master_video and probe_video(original_audio).get("audio"):
             tail = min(5.0, max(0.5, expected * 0.1))
             if _tail_max_volume(original_audio, tail) > -45 and _tail_max_volume(path, tail) < -55:
                 raise PipelineError("O áudio ficou silencioso no final apesar de existir fala ou áudio no original.")
@@ -453,9 +667,214 @@ def _validate_media(path: Path, role: str, job: Job, manifest: dict[str, Any], r
         if media["video"] or media["format_name"] != role or (role == "mp3" and media["audio"].get("codec_name") != "mp3"):
             raise PipelineError(f"O áudio {role.upper()} precisa ter o formato real solicitado, sem faixa de vídeo.")
         duration = report.get("summary", {}).get("duration")
-        if duration is None or abs(_number(duration, "A duração declarada") - media["audio_duration"]) > 1.0:
+        tolerance = ((1.0 / timing["sample_rate"] + 0.00001) if role == "wav" else timing["mp3_tolerance_seconds"]) if timing else 1.0
+        expected_duration = timing["duration"] if timing else _number(duration, "A duração declarada") if duration is not None else None
+        if duration is None or expected_duration is None or abs(expected_duration - media["audio_duration"]) > tolerance:
             raise PipelineError("A duração do áudio não corresponde ao relatório.")
     return media
+
+
+def _validate_audio_master_evidence(timeline: dict[str, Any], master_path: Path, timeline_path: Path,
+                                    report: dict[str, Any], manifest: dict[str, Any], language: str,
+                                    source_segments: list[dict[str, Any]] | None, job: Job) -> dict[str, Any]:
+    """Bind the mapped timeline to actual PCM; this does not certify audible quality."""
+    from colab.dubstudio_audio_master import AudioMasterError, validate_timeline
+
+    try:
+        validate_timeline(timeline, source_segments=source_segments)
+    except (AudioMasterError, ValueError, TypeError, KeyError) as error:
+        raise PipelineError(f"O mapa de áudio natural não é válido: {error}") from error
+    expected_source = manifest["inputs"]["video"]["sha256"]
+    if (timeline.get("input_sha256") != manifest["input_sha256"]
+            or timeline.get("source_video_sha256") != expected_source
+            or timeline.get("target_language") != language):
+        raise PipelineError("O mapa de vídeo adaptado pertence a outro vídeo ou idioma.")
+    if source_segments is not None:
+        _match_approved_segments(timeline.get("source_segments"), source_segments)
+    master_hash, timeline_hash = sha256_file(master_path), sha256_file(timeline_path)
+    master = timeline.get("audio_master", {})
+    if (master.get("sha256") != master_hash or report.get("master_audio_sha256") != master_hash
+            or report.get("timeline_sha256") != timeline_hash):
+        raise PipelineError("O áudio mestre ou o mapa de vídeo não corresponde ao relatório.")
+    try:
+        with wave.open(str(master_path), "rb") as audio:
+            rate, samples = audio.getframerate(), audio.getnframes()
+            if audio.getcomptype() != "NONE" or audio.getnchannels() < 1 or audio.getsampwidth() not in {2, 3, 4}:
+                raise PipelineError("O áudio mestre precisa ser um WAV PCM real.")
+            expected_bytes = samples * audio.getnchannels() * audio.getsampwidth()
+            actual_bytes = 0
+            while block := audio.readframes(1024 * 1024):
+                actual_bytes += len(block)
+            if actual_bytes != expected_bytes:
+                raise PipelineError("O WAV mestre está truncado apesar do cabeçalho de amostras.")
+    except (wave.Error, EOFError) as error:
+        raise PipelineError("O áudio mestre não é um WAV PCM válido.") from error
+    if master.get("sample_rate") != rate or master.get("sample_count") != samples or samples <= 0:
+        raise PipelineError("O relógio do áudio mestre diverge das amostras físicas do WAV.")
+    adjustments = report.get("timing_adjustments", [])
+    if not isinstance(adjustments, list) or any(not isinstance(item, dict) or _number(item.get("factor", 1.0), "A velocidade vocal") != 1.0 for item in adjustments):
+        raise PipelineError("O áudio natural não pode conter ajuste de velocidade para caber no vídeo.")
+    if any(_number(item.get("speed", 1.0), "A velocidade do trecho") != 1.0 for item in timeline["source_segments"]):
+        raise PipelineError("Um trecho do áudio mestre foi acelerado ou desacelerado.")
+    duration = samples / rate
+    if abs(_number(report.get("summary", {}).get("duration"), "A duração do áudio mestre") - duration) > 1.0 / rate:
+        raise PipelineError("A duração declarada não corresponde ao áudio natural completo.")
+    base = timeline["video_base"]
+    declared_timing = report.get("timing")
+    if (not isinstance(declared_timing, dict) or declared_timing.get("policy") != timeline["policy"]
+            or declared_timing.get("sample_rate") != rate or declared_timing.get("sample_count") != samples
+            or declared_timing.get("source_segments_sha256") != timeline["source_segments_sha256"]
+            or declared_timing.get("video_base") != base):
+        raise PipelineError("O resumo de montagem não corresponde à linha de áudio e vídeo recebida.")
+    source_clock = timeline.get("source_video")
+    if not isinstance(source_clock, dict):
+        raise PipelineError("Falta o relógio original que vincula as repetições de vídeo.")
+    original_video = _input_path(job, "video") or job.input_path
+    if manifest.get("proxy_created"):
+        original_video = (job.directory / "proxy-1080p.mp4").resolve()
+        if not original_video.is_relative_to(job.directory.resolve()):
+            raise PipelineError("O proxy de vídeo aponta para fora do projeto.")
+    if not original_video.is_file() or sha256_file(original_video) != expected_source:
+        raise PipelineError("A fonte local do mapa de quadros não corresponde ao vídeo empacotado.")
+    original_stream = _probe_streams(original_video)["video"]
+    try:
+        source_fps = Fraction(str(original_stream.get("avg_frame_rate") or original_stream.get("r_frame_rate")))
+        source_frames = _actual_video_frame_count(original_video, original_stream)
+        mapped_source_fps = Fraction(source_clock["fps_num"], source_clock["fps_den"])
+        output_fps = Fraction(base["fps_num"], base["fps_den"])
+    except (ValueError, KeyError, ZeroDivisionError, TypeError) as error:
+        raise PipelineError("Os relógios da fonte e da montagem não são verificáveis.") from error
+    if source_fps != mapped_source_fps or source_clock.get("frame_count") != source_frames or output_fps != source_fps:
+        raise PipelineError("O mapa de repetições alterou o relógio ou o total de quadros originais.")
+    width, height = int(original_stream.get("width", 0)), int(original_stream.get("height", 0))
+    if (source_clock.get("width") != width or source_clock.get("height") != height
+            or base.get("width") != width or base.get("height") != height):
+        raise PipelineError("As dimensões do mapa não correspondem à fonte das coordenadas faciais.")
+    mappings = timeline.get("visual_mapping")
+    if not isinstance(mappings, list):
+        raise PipelineError("Faltam os cortes e repetições vinculados a cada pessoa.")
+    for turn, mapping in zip(timeline["turns"], mappings):
+        frame_seconds = float(1 / source_fps)
+        if (mapping["source_start_frame"] / float(source_fps) < turn["source_start"] - frame_seconds
+                or mapping["source_end_frame"] / float(source_fps) > turn["source_end"] + frame_seconds):
+            raise PipelineError("Um corte/repetição usa imagens fora do turno da pessoa correspondente.")
+        if mapping.get("face_confirmation") == "no_face_confirmed":
+            if mapping.get("speaker_confirmation") != "narration" or mapping.get("source_face_track_id") is not None:
+                raise PipelineError("Uma narração sem rosto não pode declarar uma trilha facial confirmada.")
+        else:
+            track = mapping.get("source_face_track_id")
+            if (mapping.get("face_confirmation") not in {"detected", "user_selected"}
+                    or mapping.get("speaker_confirmation") not in {"active_speaker", "user_selected", "external_audio"}
+                    or isinstance(track, bool) or not isinstance(track, (str, int)) or str(track).strip() == ""):
+                raise PipelineError("O mapa não confirma a associação entre a voz e a pessoa mostrada.")
+    if (not isinstance(base.get("sha256"), str) or not _SHA_RE.fullmatch(base["sha256"])
+            or not isinstance(base.get("path"), str) or not base["path"]
+            or PurePosixPath(_safe_path(master.get("path"))).name != master_path.name):
+        raise PipelineError("O mapa está sem os arquivos de origem do áudio ou do vídeo adaptado.")
+    _safe_path(base["path"])
+    frame_tolerance = base["fps_den"] / base["fps_num"] + 0.001
+    if abs(base["frame_count"] * base["fps_den"] / base["fps_num"] - duration) > frame_tolerance:
+        raise PipelineError("O mapa de quadros não termina junto com o áudio mestre.")
+    if manifest["operation"] == "lipsync_video":
+        # The supplied audio is never fitted to the old source-video duration.
+        submitted = manifest["inputs"]["audio"]["sha256"]
+        if timeline.get("submitted_audio_sha256") != submitted:
+            raise PipelineError("O áudio enviado não está ligado ao áudio mestre natural.")
+    composition = report.get("spatial_composition")
+    confirmed = report.get("lipsync", {}).get("confirmed_segments", [])
+    if confirmed:
+        if (not isinstance(composition, dict)
+                or composition.get("policy") != "perioral-mapped-source-dwpose68-inner-feather-v1"
+                or composition.get("timeline_sha256") != timeline_hash
+                or composition.get("source_video_sha256") != expected_source
+                or composition.get("output_base_sha256") != base.get("sha256")
+                or composition.get("audio_master_sha256") != master_hash):
+            raise PipelineError("O lip-sync não comprova a composição sobre o vídeo adaptado desta fala.")
+        for face in confirmed:
+            start = _number(face.get("start"), "O início do rosto sincronizado")
+            end = _number(face.get("end"), "O fim do rosto sincronizado")
+            if not any(face.get("speaker") == mapping["speaker"]
+                       and start >= mapping["output_start_frame"] / float(output_fps) - 0.001
+                       and end <= mapping["output_end_frame"] / float(output_fps) + 0.001
+                       for mapping in mappings):
+                raise PipelineError("O rosto sincronizado cruza uma troca de pessoa ou pertence a outra voz.")
+        records = composition.get("evidence")
+        if not isinstance(records, list) or len(records) != len(confirmed):
+            raise PipelineError("Falta a prova de quadros compostos para uma janela de lip-sync.")
+        for face, record in zip(confirmed, records):
+            first, last = float(face["start"]) * float(output_fps), float(face["end"]) * float(output_fps)
+            if (abs(first - round(first)) > 1e-6 or abs(last - round(last)) > 1e-6
+                    or not isinstance(record, dict) or record.get("frame_count") != round(last) - round(first)):
+                raise PipelineError("A composição não confirma os quadros nativos da janela facial aplicada.")
+    for preserved in report.get("preserved_no_speaker_visual_segments", []):
+        if not isinstance(preserved, dict):
+            raise PipelineError("Uma janela preservada não possui evidência de montagem válida.")
+        start = _number(preserved.get("start"), "O início do trecho preservado")
+        end = _number(preserved.get("end"), "O fim do trecho preservado")
+        if preserved.get("kind") == "canonical_neutral_boundary":
+            maximum = max(float(1 / output_fps), 1 / 25)
+            if (preserved.get("policy") != "audio-master-native-boundary-preservation-v1"
+                    or preserved.get("machine_confirmed") is not False
+                    or abs(_number(preserved.get("maximum_seconds"), "O limite de fronteira neutra") - maximum) > 1e-9
+                    or not 0 < end - start <= maximum + 1e-6
+                    or not any(preserved.get("source_segment_id") == item["source_segment_id"]
+                               and preserved.get("speaker") == item["speaker"]
+                               and start >= item["output_start_frame"] / float(output_fps) - 0.001
+                               and end <= item["output_end_frame"] / float(output_fps) + 0.001
+                               and (abs(start - item["output_start_frame"] / float(output_fps)) <= 0.001
+                                    or abs(end - item["output_end_frame"] / float(output_fps)) <= 0.001)
+                               for item in mappings)):
+                raise PipelineError("A fronteira neutra excede um quadro ou não pertence à borda da pessoa correta.")
+        else:
+            no_face = [(item["output_start_frame"] / float(output_fps), item["output_end_frame"] / float(output_fps))
+                       for item in mappings if item.get("face_confirmation") == "no_face_confirmed"]
+            cursor = start
+            for left, right in sorted(no_face):
+                if left <= cursor + 0.001 and right > cursor:
+                    cursor = right
+            if end <= start or cursor < end - 0.001:
+                raise PipelineError("Um rosto falante foi preservado sem lip-sync e sem prova de fronteira neutra.")
+    return {"duration": duration, "sample_rate": rate, "sample_count": samples,
+            "fps_num": output_fps.numerator, "fps_den": output_fps.denominator, "frame_count": base["frame_count"],
+            "width": width, "height": height,
+            "video_duration": base["frame_count"] / float(output_fps),
+            "frame_tolerance_seconds": frame_tolerance, "codec_tolerance_seconds": 1024.0 / rate + 0.01,
+            "mp3_tolerance_seconds": 2304.0 / rate + 0.01,
+            "master_audio_sha256": master_hash, "timeline_sha256": timeline_hash}
+
+
+def _validate_audio_master_subtitles(paths: dict[str, str], directory: Path, timeline: dict[str, Any]) -> None:
+    """Require SRT text and clocks to match the already verified natural turns.
+
+    This uses the exact millisecond rounding of the notebook's write_srt;
+    the immutable source snapshot supplies text, never its old video times.
+    Comparing the complete canonical rows also checks cue count, numbering
+    and order without silently accepting an omitted or duplicated turn.
+    """
+    rate = timeline["sample_rate"]
+    source = {item["id"]: item for item in timeline["source_segments"]}
+
+    def timestamp(sample: int) -> str:
+        millis = max(0, round((sample / rate) * 1000))
+        hours, millis = divmod(millis, 3_600_000)
+        minutes, millis = divmod(millis, 60_000)
+        seconds, millis = divmod(millis, 1000)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+    for role, key in (("original_srt", "text"), ("translation_srt", "translated_text")):
+        rows = []
+        for index, turn in enumerate(timeline["turns"], 1):
+            item = source[turn["source_segment_id"]]
+            text = item.get(key)
+            if not isinstance(text, str) or not text.strip():
+                raise PipelineError("Falta o texto verificado de uma legenda do áudio natural.")
+            rows.extend([str(index), f"{timestamp(turn['output_start_sample'])} --> {timestamp(turn['output_end_sample'])}", text.strip(), ""])
+        try:
+            actual = (directory / paths[role]).read_text(encoding="utf-8")
+        except (KeyError, UnicodeError) as error:
+            raise PipelineError("Falta uma legenda SRT íntegra do áudio natural.") from error
+        if actual.rstrip("\n") != "\n".join(rows).rstrip("\n"):
+            raise PipelineError("As legendas não correspondem aos textos, à ordem e ao relógio de amostras do áudio natural.")
 
 
 def _audio_window_peak(path: Path, start: float, duration: float) -> float:
@@ -553,8 +972,13 @@ def import_studio_result(job: Job, result_zip: Path) -> dict[str, Any]:
                 if not isinstance(files, dict) or not isinstance(checksums, dict):
                     raise PipelineError("Faltam arquivos ou checksums do resultado.")
                 required = {"video", "report"} if manifest["operation"] != "text_to_voice" else {"wav", "mp3", "report", "segments"}
+                if manifest["operation"] == "lipsync_video":
+                    required.update({"wav", "mp3"})
                 if manifest["operation"] == "dub_video":
                     required.update({"segments", "original_srt", "translation_srt"})
+                audio_master_video = _audio_master_mode(manifest) and manifest["operation"] != "text_to_voice"
+                if audio_master_video:
+                    required.update({"timeline", "master_audio"})
                 if not required.issubset(files):
                     raise PipelineError("O resultado está incompleto para a operação solicitada.")
                 paths: dict[str, str] = {}
@@ -580,17 +1004,31 @@ def import_studio_result(job: Job, result_zip: Path) -> dict[str, Any]:
                 if set(checksums) != set(paths.values()):
                     raise PipelineError("Os checksums não correspondem exatamente aos arquivos declarados.")
                 report = _read_json(archive, members, paths["report"])
-                _validate_report(report, job, manifest, language)
+                if not audio_master_video:
+                    _validate_report(report, job, manifest, language)
                 evidence = None
                 if "segments" in paths:
                     evidence = _read_json(archive, members, paths["segments"])
                     if evidence.get("target_language") != language:
                         raise PipelineError("Os segmentos traduzidos pertencem a outro idioma.")
                     evidence_duration = (_number(report.get("summary", {}).get("duration"), "A duração da voz gerada")
-                                         if manifest["operation"] == "text_to_voice" else float(manifest["input_metadata"]["duration"]))
+                                         if manifest["operation"] == "text_to_voice" else _source_media_duration(job, manifest["operation"]))
                     _segments(evidence.get("segments"), evidence_duration)
                     if approved_review:
                         _match_approved_segments(evidence["segments"], approved_review["translations"][language])
+                timing = None
+                if audio_master_video:
+                    timeline = _read_json(archive, members, paths["timeline"])
+                    if approved_review:
+                        _match_approved_segments(timeline.get("source_segments"), approved_review["translations"][language])
+                    timing = _validate_audio_master_evidence(
+                        timeline, staging / paths["master_audio"], staging / paths["timeline"],
+                        report, manifest, language, evidence.get("segments") if evidence else None, job)
+                if audio_master_video:
+                    _validate_report(report, job, manifest, language, timing)
+                _validate_voice_reference_proof(report, manifest, evidence.get("segments") if evidence else None)
+                if audio_master_video and manifest["operation"] == "dub_video":
+                    _validate_audio_master_subtitles(paths, staging, timeline)
                 for role in ("original_srt", "translation_srt"):
                     if role in paths:
                         try:
@@ -598,7 +1036,7 @@ def import_studio_result(job: Job, result_zip: Path) -> dict[str, Any]:
                                 raise ValueError("empty subtitle")
                         except (UnicodeError, ValueError) as exc:
                             raise PipelineError("Uma evidência de legendas está vazia ou não é um SRT válido.") from exc
-                media = {role: _validate_media(staging / paths[role], role, job, manifest, report) for role in ("video", "wav", "mp3") if role in paths}
+                media = {role: _validate_media(staging / paths[role], role, job, manifest, report, timing) for role in ("video", "wav", "mp3") if role in paths}
                 lipsync_confirmed = False
                 if manifest["options"].get("require_lipsync") is True:
                     lipsync_confirmed = _validate_lipsync(report, media["video"]["video_duration"], manifest["operation"])
@@ -611,7 +1049,11 @@ def import_studio_result(job: Job, result_zip: Path) -> dict[str, Any]:
                     "authorized_clone": manifest["operation"] in {"dub_video", "text_to_voice"},
                     "lipsync_requested": manifest["options"].get("require_lipsync") is True,
                     "lipsync_confirmed": lipsync_confirmed,
-                    "duration_tolerance_seconds": 1.0,
+                    "duration_tolerance_seconds": timing["frame_tolerance_seconds"] if timing else 1.0,
+                    "timing_mode": "audio_master" if _audio_master_mode(manifest) else "source_video",
+                    **({"audio_master": timing, "human_visual_review": "pending"} if timing else {}),
+                    **({"subtitle_clock": "audio-master-samples-rounded-milliseconds"}
+                       if timing and manifest["operation"] == "dub_video" else {}),
                 }})
         successes = [record for record in output_records if record["status"] == "complete"]
         destination = job.directory / "studio-results" / uuid.uuid4().hex
@@ -642,7 +1084,7 @@ def _validate_review(payload: dict[str, Any], job: Job, manifest: dict[str, Any]
         raise PipelineError("A revisão precisa conter os idiomas solicitados no projeto.")
     if not isinstance(payload.get("source_language"), str) or not re.fullmatch(r"[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*", payload["source_language"]):
         raise PipelineError("A revisão não informa o idioma original.")
-    duration = float(manifest["input_metadata"]["duration"])
+    duration = _source_media_duration(job, manifest["operation"])
     original_segments = None
     for segments in translations.values():
         _segments(segments, duration)
@@ -710,7 +1152,7 @@ def export_approved_review(job: Job, payload: dict[str, Any]) -> Path:
     }}
     public_workers = {f"worker/{name}": ROOT / "colab" / name for name in (
         "dubstudio_bootstrap.py", "dubstudio_runner_v2.py", "dubstudio_colab_worker.py", "dubstudio_translate.py",
-        "requirements-app.txt", "requirements-musetalk.txt",
+        "dubstudio_audio_master.py", "requirements-app.txt", "requirements-musetalk.txt",
     )}
     base_package = job.directory / PACKAGE_NAME
     if not zipfile.is_zipfile(base_package):

@@ -159,7 +159,8 @@ class IntegrityTests(unittest.TestCase):
             fingerprint = hashlib.sha256(requirements.read_bytes() + bootstrap.PIPELINE_VERSION.encode()).hexdigest()
             runner.write_json(ready, {"fingerprint": fingerprint})
             with patch.object(bootstrap, "gpu_precheck", return_value="GPU protocol fixture"), patch.object(bootstrap.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(100 * 1024**3, 0, 100 * 1024**3)), patch.object(bootstrap.shutil, "which", return_value="available"), patch.object(bootstrap, "execute") as execute, patch.object(bootstrap, "clone_at") as clone, patch.object(bootstrap, "download_model_weights") as weights, patch.object(bootstrap, "persist_cache"):
-                bootstrap.prepare(runtime, storage, needs_lipsync=False)
+                with patch.object(bootstrap, "patch_speechbrain_hub_compatibility"):
+                    bootstrap.prepare(runtime, storage, needs_lipsync=False)
             clone.assert_not_called()
             weights.assert_not_called()
             self.assertFalse((runtime / "musetalk-env").exists())
@@ -304,7 +305,7 @@ class ProcessProtocolTests(unittest.TestCase):
         output = self.root / "result.zip"
         def fixture_command(command, *args, **kwargs):
             Path(command[-1]).write_bytes(b"MP3 protocol fixture")
-        with patch.object(bootstrap, "gpu_precheck", return_value="GPU protocol fixture, not verified"), patch.object(runner, "media_info", return_value={"duration": 2.0}), patch.object(runner.StageCache, "stage", autospec=True, side_effect=self.fake_stage), patch.object(runner, "run_command", side_effect=fixture_command):
+        with patch.object(bootstrap, "gpu_precheck", return_value="GPU protocol fixture, not verified"), patch.object(runner, "media_info", return_value={"duration": 2.0, "streams": [{"codec_type": "video", "duration": "2.0"}, {"codec_type": "audio", "duration": "2.0"}]}), patch.object(runner.StageCache, "stage", autospec=True, side_effect=self.fake_stage), patch.object(runner, "run_command", side_effect=fixture_command):
             result = runner.process(self.root, self.root / "work", self.root / "storage", output)
         return result, output
 
@@ -335,7 +336,7 @@ class RealMediaValidationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         binary = shutil.which("ffmpeg")
-        candidate = Path("C:/Users/edeni/Downloads/ffmpeg-8.1-essentials_build/bin/ffmpeg.exe")
+        candidate = Path.home() / "Downloads" / "ffmpeg-8.1-essentials_build" / "bin" / "ffmpeg.exe"
         cls.ffmpeg = Path(binary) if binary else candidate
         if not cls.ffmpeg.is_file():
             raise unittest.SkipTest("FFmpeg unavailable for real media-stream validation")
@@ -351,6 +352,61 @@ class RealMediaValidationTests(unittest.TestCase):
                 self.assertLessEqual(proof["timing_tolerance_seconds"], 1.0)
                 with self.assertRaisesRegex(runner.PipelineError, "Resultado incompleto"):
                     runner.verify_final_media(shortened, 2.0)
+
+
+class FinalMediaFinitenessTests(unittest.TestCase):
+    """Metadata safety, independent of model/render quality."""
+    def setUp(self):
+        self.video = Path("synthetic-metadata.mp4")
+        self.info = {"duration": 2.0, "streams": [
+            {"codec_type": "video", "duration": "2.0"},
+            {"codec_type": "audio", "duration": "2.0", "channels": 2},
+        ]}
+
+    def test_nonfinite_video_or_audio_duration_is_never_approved(self):
+        for kind in ("video", "audio"):
+            for invalid in ("NaN", "Infinity", "-Infinity", float("nan"), float("inf")):
+                info = copy.deepcopy(self.info)
+                next(stream for stream in info["streams"] if stream["codec_type"] == kind)["duration"] = invalid
+                with self.subTest(kind=kind, invalid=invalid), patch.object(runner, "media_info", return_value=info):
+                    with self.assertRaisesRegex(runner.PipelineError, "Resultado incompleto"):
+                        runner.verify_final_media(self.video,2.0)
+
+    def test_nonfinite_or_nonpositive_expected_duration_stops_before_probe(self):
+        for invalid in (float("nan"), float("inf"), float("-inf"), 0, -1, None, "invalid"):
+            with self.subTest(invalid=invalid), patch.object(runner, "media_info") as probe:
+                with self.assertRaisesRegex(runner.PipelineError, "duração esperada"):
+                    runner.verify_final_media(self.video,invalid)
+                probe.assert_not_called()
+
+    def test_nonfinite_or_nonpositive_container_duration_is_not_published(self):
+        for invalid in ("NaN", "Infinity", "-Infinity", 0, -1):
+            info = {**self.info, "duration": invalid}
+            with self.subTest(invalid=invalid), patch.object(runner, "media_info", return_value=info):
+                with self.assertRaisesRegex(runner.PipelineError, "contêiner"):
+                    runner.verify_final_media(self.video,2.0)
+
+    def test_malformed_duration_metadata_fails_with_pipeline_error(self):
+        for kind in ("video", "audio", "container"):
+            for invalid in (None, "N/A", [], {}):
+                info = copy.deepcopy(self.info)
+                if kind == "container":
+                    info["duration"] = invalid
+                else:
+                    next(stream for stream in info["streams"] if stream["codec_type"] == kind)["duration"] = invalid
+                with self.subTest(kind=kind, invalid=invalid), patch.object(runner, "media_info", return_value=info):
+                    with self.assertRaises(runner.PipelineError):
+                        runner.verify_final_media(self.video,2.0)
+
+    def test_valid_finite_durations_remain_approved_with_existing_tolerance(self):
+        for audio_duration in (1.0,2.0,3.0):
+            info = copy.deepcopy(self.info)
+            info["streams"][1]["duration"] = audio_duration
+            with self.subTest(audio_duration=audio_duration), patch.object(runner, "media_info", return_value=info):
+                result = runner.verify_final_media(self.video,2.0)
+            self.assertEqual(result["audio_duration"],audio_duration)
+            self.assertTrue(all(math.isfinite(result[key]) for key in
+                                ("duration","video_duration","audio_duration","timing_tolerance_seconds")))
 
 
 class NotebookTests(unittest.TestCase):

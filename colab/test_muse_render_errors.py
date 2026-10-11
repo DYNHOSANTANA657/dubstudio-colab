@@ -113,6 +113,7 @@ class MuseRenderErrorTests(unittest.TestCase):
         failure = self.result("Error occurred during processing: CUDA out of memory")
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.dict(worker.os.environ, {"DUBSTUDIO_TALKNET_ROOT": str(talknet), "DUBSTUDIO_MUSETALK_ROOT": str(muse)}))
+            clock = stack.enter_context(patch.object(worker, "patch_musetalk_audio_frame_clock", return_value={"revision": "mock-pcm-clock"}))
             stack.enter_context(patch.object(worker, "ffprobe", return_value=media))
             stack.enter_context(patch.object(worker, "video_stream_duration", return_value=2.0))
             stack.enter_context(patch.object(worker, "video_frame_count", return_value=50))
@@ -130,6 +131,8 @@ class MuseRenderErrorTests(unittest.TestCase):
                     renderer(video, audio, self.root, analysis, self.root / "test.log", True)
             with self.subTest(renderer="musetalk"), self.assertRaisesRegex(worker.WorkerError, "out of memory"):
                 worker.musetalk(video, audio, self.root, {}, self.root / "test.log", True, True)
+            self.assertEqual(clock.call_count, 3)
+            self.assertTrue(all(entry.args == (muse,) for entry in clock.call_args_list))
 
 
 if __name__ == "__main__":

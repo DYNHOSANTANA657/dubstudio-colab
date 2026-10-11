@@ -228,7 +228,7 @@ class ReviewResumeTests(unittest.TestCase):
                 self.fail(f"Unexpected nondeterministic stage after approval: {key}")
 
         with patch.object(bootstrap, "gpu_precheck", return_value="Mock T4, not live validation"), \
-             patch.object(runner, "media_info", return_value={"duration": 3.0}), \
+             patch.object(runner, "media_info", return_value={"duration": 3.0, "streams": [{"codec_type": "video", "duration": "3.0"}, {"codec_type": "audio", "duration": "3.0"}]}), \
              patch.object(runner, "worker_fingerprint", return_value="a-new-fixed-worker-fingerprint"), \
              patch.object(runner.StageCache, "stage", fake_stage):
             with self.assertRaises(StopBeforeGpuModels):

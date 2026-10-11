@@ -98,7 +98,7 @@ class LipSyncOrchestrationTests(unittest.TestCase):
         def command(arguments, *args, **kwargs):
             Path(arguments[-1]).write_bytes(b"MP3 protocol fixture")
         with patch.object(bootstrap, "gpu_precheck", return_value="protocol fixture GPU, not tested"), \
-             patch.object(runner, "media_info", side_effect=media or (lambda _: {"duration": 2.0})), \
+             patch.object(runner, "media_info", side_effect=media or (lambda _: {"duration": 2.0, "streams": [{"codec_type": "video", "duration": "2.0"}, {"codec_type": "audio", "duration": "2.0"}]})), \
              patch.object(runner.StageCache, "stage", autospec=True, side_effect=self.fake_stage), \
              patch.object(runner, "run_command", side_effect=command):
             result = runner.process(self.root, self.root / "work", self.root / "storage", output)
@@ -142,7 +142,9 @@ class LipSyncOrchestrationTests(unittest.TestCase):
     def test_audio_overshoot_fails_before_analysis_and_never_truncates(self):
         self.configure("lipsync_video")
         with self.assertRaisesRegex(runner.PipelineError, "nenhuma fala"):
-            self.execute(lambda file: {"duration": 2.1 if file.suffix == ".wav" else 2.0})
+            self.execute(lambda file: {"duration": 2.1 if file.suffix == ".wav" else 2.0,
+                "streams": [{"codec_type": "audio", "duration": "2.1"}] if file.suffix == ".wav"
+                else [{"codec_type": "video", "duration": "2.0"}, {"codec_type": "audio", "duration": "2.0"}]})
         self.assertFalse(self.stage_configs)
 
     def test_global_failure_before_outputs_binds_both_inputs_in_result_and_report(self):
@@ -275,6 +277,7 @@ class AnalysisAudioTests(unittest.TestCase):
                  patch.object(runner, "run_command", side_effect=command), \
                  patch.object(legacy, "write_progress"), \
                  patch.object(legacy, "run_streaming", side_effect=analyse), \
+                 patch.object(legacy, "patch_talknet_video_normalization", return_value=legacy.TALKNET_NORMALIZATION_REVISION), \
                  patch.object(legacy, "video_frame_count", return_value=25):
                 runner.stage_main("analysis", config)
             self.assertEqual(len(commands), 1)

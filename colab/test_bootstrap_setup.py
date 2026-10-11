@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import call, patch
 
 import dubstudio_bootstrap as bootstrap
+import dubstudio_colab_worker as worker
 
 
 class CloneMaterializationTests(unittest.TestCase):
@@ -150,7 +151,7 @@ class DependencyContractTests(unittest.TestCase):
             and "musetalk.utils.preprocessing" in command[-1]
         )
 
-    def prepare_mocked(self, *, fail_when=None, on_execute=None):
+    def prepare_mocked(self, *, fail_when=None, on_execute=None, needs_lipsync=True, needs_face_analysis=False):
         def execute(command, **kwargs):
             self.commands.append((list(command), kwargs.copy()))
             if on_execute:
@@ -163,13 +164,47 @@ class DependencyContractTests(unittest.TestCase):
             stack.enter_context(patch.object(bootstrap.shutil, "disk_usage", return_value=SimpleNamespace(free=30 * 1024**3)))
             stack.enter_context(patch.object(bootstrap.shutil, "which", return_value="mock-installed-tool"))
             stack.enter_context(patch.object(bootstrap, "execute", side_effect=execute))
+            stack.enter_context(patch.object(bootstrap, "patch_speechbrain_hub_compatibility"))
             stack.enter_context(patch.object(bootstrap, "clone_at"))
+            self.audio_clock = stack.enter_context(patch.object(worker, "patch_musetalk_audio_frame_clock", return_value={"revision": "mock-pcm-clock"}))
             stack.enter_context(patch.object(bootstrap, "download_model_weights"))
             stack.enter_context(patch.object(bootstrap, "copy_missing"))
             stack.enter_context(patch.object(bootstrap, "persist_cache"))
             stack.enter_context(patch.object(Path, "symlink_to"))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
-            return bootstrap.prepare(self.runtime, self.storage, needs_lipsync=True)
+            return bootstrap.prepare(self.runtime, self.storage, needs_lipsync=needs_lipsync, needs_face_analysis=needs_face_analysis)
+
+    def test_audio_master_without_lipsync_prepares_only_missing_face_weights(self):
+        weights = self.runtime / "models/talknet"
+        weights.mkdir(parents=True)
+        cached = weights / "sfd_face.pth"
+        cached.write_bytes(b"existing cached detector")
+
+        def materialize_download(command, options):
+            if command[0].endswith("gdown"):
+                Path(command[-1]).write_bytes(b"downloaded mock TalkNet weight")
+
+        self.prepare_mocked(needs_lipsync=False, needs_face_analysis=True, on_execute=materialize_download)
+        downloads = [command for command, _ in self.commands if command[0].endswith("gdown")]
+        self.assertEqual(len(downloads), 1)
+        self.assertTrue(downloads[0][-1].endswith("pretrain_TalkSet.model"))
+        self.assertEqual(cached.read_bytes(), b"existing cached detector")
+        self.assertEqual((self.runtime / "TalkNet-ASD/model/faceDetector/s3fd/sfd_face.pth").read_bytes(), cached.read_bytes())
+        self.assertTrue((self.runtime / "TalkNet-ASD/pretrain_TalkSet.model").is_file())
+        self.audio_clock.assert_not_called()
+        self.assertFalse(any(command[0] in {self.muse_python, self.muse_mim} for command, _ in self.commands))
+
+    def test_face_preparation_fails_if_a_required_download_does_not_materialize(self):
+        with self.assertRaisesRegex(RuntimeError, "Peso obrigatório não foi baixado"):
+            self.prepare_mocked(needs_lipsync=False, needs_face_analysis=True)
+        self.audio_clock.assert_not_called()
+        self.assertFalse((self.runtime / "TalkNet-ASD/model/faceDetector/s3fd/sfd_face.pth").exists())
+
+    def test_tts_and_legacy_no_lipsync_do_not_prepare_face_or_muse_weights(self):
+        self.prepare_mocked(needs_lipsync=False, needs_face_analysis=False)
+        self.audio_clock.assert_not_called()
+        self.assertFalse(any(command[0].endswith("gdown") or command[0] in {self.muse_python, self.muse_mim} for command, _ in self.commands))
+        self.assertFalse((self.runtime / "models/talknet").exists())
 
     def assert_isolated(self, values):
         path, _ = self.requirements()
@@ -188,6 +223,10 @@ class DependencyContractTests(unittest.TestCase):
         for name, version in requirements.items():
             if name.startswith("opencv-python"):
                 self.assertEqual(version, "4.9.0.80")
+
+    def test_preparation_checks_the_same_pinned_audio_clock_as_worker(self):
+        self.prepare_mocked()
+        self.audio_clock.assert_called_once_with(self.runtime / "MuseTalk")
 
     def test_tomli_is_explicit_for_yapf_under_python310(self):
         _, requirements = self.requirements()

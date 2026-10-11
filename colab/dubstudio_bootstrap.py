@@ -8,6 +8,7 @@ os downloads concluídos, mas nunca é interpretada como instalação pronta.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -52,6 +53,19 @@ def gpu_precheck() -> str:
     if not result.stdout.strip():
         raise RuntimeError("O Colab não concedeu uma GPU nesta sessão. Nenhum modelo foi baixado.")
     return result.stdout.strip()
+
+
+def environment_is_ready(marker: Path, fingerprint: str) -> bool:
+    """An unreadable/incompatible marker never certifies an environment.
+
+    Reading does not remove prior markers, environments, models or checkpoints;
+    prepare() replaces this marker only after its own checks complete.
+    """
+    try:
+        record = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(record, dict) and record.get("fingerprint") == fingerprint
 
 
 def file_digest(file: Path) -> bytes:
@@ -267,7 +281,57 @@ def musetalk_environment(runtime: Path, inherited: dict | None = None) -> dict[s
     return values
 
 
-def prepare(runtime: Path, storage: Path, needs_lipsync: bool = True) -> dict:
+def speechbrain_hub_compatible_source(source: str) -> str:
+    """Restore SpeechBrain 1.0.3's missing-file contract with Hub 1.x.
+
+    Hub 1.x uses httpx instead of requests, so its *remote entry* 404 no longer
+    reaches SpeechBrain's requests.HTTPError handler. Only that precise error
+    is converted to ValueError, the existing contract used for optional
+    custom.py. Required parameters/weights still fail; auth, repository,
+    revision, offline and transport errors are never classified as optional.
+    """
+    import_anchor = "import huggingface_hub\n"
+    compat_import = "from huggingface_hub.errors import RemoteEntryNotFoundError as _DubStudioRemoteEntryNotFoundError\n"
+    handler_anchor = "    except HTTPError as e:\n        if \"404 Client Error\" in str(e):\n"
+    compat_handler = (
+        "    except _DubStudioRemoteEntryNotFoundError as e:\n"
+        "        raise ValueError(\"File not found on HF hub\") from e\n"
+    )
+    if compat_import in source and compat_handler + handler_anchor in source:
+        ast.parse(source)
+        return source
+    if (
+        "_DubStudioRemoteEntryNotFoundError" in source
+        or source.count(import_anchor) != 1 or source.count(handler_anchor) != 1
+    ):
+        raise RuntimeError("O código instalado do SpeechBrain não corresponde à compatibilidade testada; preparação recusada.")
+    updated = source.replace(import_anchor, import_anchor + compat_import, 1)
+    updated = updated.replace(handler_anchor, compat_handler + handler_anchor, 1)
+    ast.parse(updated)
+    return updated
+
+
+def patch_speechbrain_hub_compatibility(runtime: Path) -> bool:
+    """Patch the pinned installed dependency, leaving pipeline hashes unchanged."""
+    target = runtime / "app-env/lib/python3.10/site-packages/speechbrain/utils/fetching.py"
+    if not target.is_file():
+        raise RuntimeError("SpeechBrain não foi instalado no ambiente de dublagem; preparação recusada.")
+    original = target.read_bytes()
+    source = original.decode("utf-8").replace("\r\n", "\n")
+    updated = speechbrain_hub_compatible_source(source)
+    if updated == source:
+        return False
+    backup = target.with_name("fetching.py.dubstudio-hub-original")
+    if not backup.exists():
+        backup.write_bytes(original)
+    temporary = target.with_name("fetching.py.dubstudio-hub-writing")
+    temporary.write_text(updated, encoding="utf-8")
+    temporary.replace(target)
+    print("Compatibilidade SpeechBrain/Hub conferida; somente custom.py ausente é opcional.", flush=True)
+    return True
+
+
+def prepare(runtime: Path, storage: Path, needs_lipsync: bool = True, *, needs_face_analysis: bool = False) -> dict:
     gpu = gpu_precheck()  # Must run before apt/pip or any model download.
     runtime.mkdir(parents=True, exist_ok=True)
     storage.mkdir(parents=True, exist_ok=True)
@@ -286,7 +350,7 @@ def prepare(runtime: Path, storage: Path, needs_lipsync: bool = True) -> dict:
     fingerprint = hashlib.sha256(requirements.read_bytes() + PIPELINE_VERSION.encode()).hexdigest()
     app = runtime / "app-env"
     marker = app / ".ready.json"
-    ready = marker.exists() and json.loads(marker.read_text()).get("fingerprint") == fingerprint
+    ready = environment_is_ready(marker, fingerprint)
     if not ready:
         print("Preparando ambiente de transcrição, tradução e timbre…", flush=True)
         if not (app / "bin/python").exists():
@@ -295,11 +359,30 @@ def prepare(runtime: Path, storage: Path, needs_lipsync: bool = True) -> dict:
         execute(pip + ["install", "--quiet", "pip==25.2", "wheel==0.45.1", "setuptools==80.9.0"])
         execute(pip + ["install", "--quiet", f"resemble-perth @ git+https://github.com/resemble-ai/Perth.git@{PERTH_COMMIT}"])
         execute(pip + ["install", "--quiet", "-r", str(requirements)])
+        patch_speechbrain_hub_compatibility(runtime)
         execute([str(app / "bin/python"), "-c", "import torch,torchaudio; from chatterbox.mtl_tts import ChatterboxMultilingualTTS; from faster_whisper import WhisperModel; from transformers import AutoModelForSeq2SeqLM; assert torch.cuda.is_available(); print('Imports/GPU de dublagem OK')"])
         marker.write_text(json.dumps({"fingerprint": fingerprint, "pipeline_version": PIPELINE_VERSION}))
     else:
+        patch_speechbrain_hub_compatibility(runtime)
         print("Ambiente de dublagem já preparado nesta sessão.", flush=True)
     values = environment(runtime)
+    if needs_face_analysis and not needs_lipsync:
+        # Speaker-bound editing still needs TalkNet when mouth generation is
+        # disabled. Do not install/download MuseTalk merely for video cuts.
+        clone_at("https://github.com/TaoRuijie/TalkNet-ASD.git", runtime / "TalkNet-ASD", TALKNET_COMMIT)
+        for url, name, target in (
+            ("https://drive.google.com/uc?id=1KafnHz7ccT-3IyddBsL5yi2xGtxAKypt", "sfd_face.pth", "model/faceDetector/s3fd/sfd_face.pth"),
+            ("https://drive.google.com/uc?id=1AbN9fCf9IexMxEKXLQY2KYBlb-IhSEea", "pretrain_TalkSet.model", "pretrain_TalkSet.model"),
+        ):
+            file = runtime / "models/talknet" / name
+            file.parent.mkdir(parents=True, exist_ok=True)
+            if not file.is_file() or not file.stat().st_size:
+                execute([str(runtime / "app-env/bin/gdown"), url, "-O", str(file)], env=values)
+            if not file.is_file() or not file.stat().st_size:
+                raise RuntimeError(f"Peso obrigatório não foi baixado: {name}")
+            destination = runtime / "TalkNet-ASD" / target
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(file, destination)
     if needs_lipsync:
         print("Conferindo repositórios e ambiente isolado de lip-sync…", flush=True)
         muse = runtime / "musetalk-env"
@@ -310,9 +393,12 @@ def prepare(runtime: Path, storage: Path, needs_lipsync: bool = True) -> dict:
         muse_values["PIP_CONSTRAINT"] = str(requirements.resolve())
         fingerprint = hashlib.sha256(requirements.read_bytes() + MUSE_COMMIT.encode()).hexdigest()
         marker = muse / ".ready.json"
-        ready = marker.exists() and json.loads(marker.read_text()).get("fingerprint") == fingerprint
+        ready = environment_is_ready(marker, fingerprint)
         clone_at("https://github.com/TMElyralab/MuseTalk.git", runtime / "MuseTalk", MUSE_COMMIT)
         clone_at("https://github.com/TaoRuijie/TalkNet-ASD.git", runtime / "TalkNet-ASD", TALKNET_COMMIT)
+        from dubstudio_colab_worker import patch_musetalk_audio_frame_clock
+        audio_clock = patch_musetalk_audio_frame_clock(runtime / "MuseTalk")
+        print(f"Relógio PCM de MuseTalk conferido: {audio_clock['revision']}.", flush=True)
         if not ready:
             print("Instalando dependências do MuseTalk nesta sessão…", flush=True)
             if not (muse / "bin/python").exists():
@@ -377,8 +463,10 @@ for repo,name,directory in required:
         if not file.exists() or not file.stat().st_size:
             raise RuntimeError(f"Peso obrigatório não foi baixado: {file.name}")
     resnet = runtime / "models/musetalk/face-parse-bisent/resnet18-5c106cde.pth"
-    if not resnet.exists() or not resnet.stat().st_size:
+    if not resnet.is_file() or not resnet.stat().st_size:
         execute(["curl", "--fail", "--location", "--retry", "3", "https://download.pytorch.org/models/resnet18-5c106cde.pth", "-o", str(resnet)])
+    if not resnet.is_file() or not resnet.stat().st_size:
+        raise RuntimeError(f"Peso obrigatório não foi baixado: {resnet.name}")
     for source, target in (
         (runtime / "models/talknet/sfd_face.pth", runtime / "TalkNet-ASD/model/faceDetector/s3fd/sfd_face.pth"),
         (runtime / "models/talknet/pretrain_TalkSet.model", runtime / "TalkNet-ASD/pretrain_TalkSet.model"),
